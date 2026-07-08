@@ -1,0 +1,31 @@
+# Clojure
+target/
+.cpcache/
+.nrepl-port
+.nrepl-history
+.rebel_readline_history
+.socket-repl-port
+.lsp/
+.clj-kondo/.cache/
+
+# Generated / build artifacts
+pom.xml
+*.jar
+*.class
+/classes/
+/out/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.calva/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env
+.env.local
+secrets.edn

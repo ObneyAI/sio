@@ -1,0 +1,606 @@
+(ns sio.core
+  "Structured Input/Output for LLM prompts.
+
+  `sio` manages the boundary between your program's data and an LLM: it renders
+  a typed I/O contract into a prompt, and parses the model's text (or
+  function-call) response back into validated Clojure data. It is deliberately
+  provider-agnostic — it never makes an LLM call. Bring your own client
+  (litellm-clj, an HTTP call, whatever): `sio` gives you the prompt to send and
+  parses whatever comes back.
+
+  ## Terminology
+
+  A **spec** is the I/O contract — a map:
+
+      {:inputs       [<field> ...]   ; fields you fill in
+       :outputs      [<field> ...]   ; fields you want the model to produce
+       :instructions \"...\"}          ; optional task description / rules
+
+  A **field** is a map:
+
+      {:name        :answer          ; keyword identifier
+       :spec        :string          ; a Malli schema (the field's type)
+       :description \"The answer\"      ; human-readable hint (optional)
+       :type        :image}          ; optional; :image marks a multimodal input
+
+  Note the deliberate overlap: the *container* is a spec, and each *field* also
+  carries a `:spec` — its Malli schema. Everything typed here is Malli.
+
+  ## Flow
+
+      (spec->prompt spec)                  ; contract -> prompt template
+      (build-message-content spec p input) ; inject inputs (+ images) -> message content
+      (parse-output llm-text spec)         ; model text -> {output-field value ...}
+      (validate-outputs (:outputs spec) m) ; enforce the Malli schemas
+
+  For function-calling providers, `outputs->tool-definition` emits a tool schema
+  and `parse-tool-call-response` reads the arguments back out."
+  (:require [clojure.string :as str]
+            [clojure.data.json :as json]
+            [malli.core :as m]))
+
+;; =============================================================================
+;; Malli Schema Support
+;; =============================================================================
+
+(defn complex-spec?
+  "Check if a Malli spec requires JSON serialization.
+  Returns true for :map, :map-of, :vector, :sequential, :set, :tuple, etc.
+  Handles both bare keywords (:map) and vector forms ([:map ...]).
+  Note: :enum is NOT included - enums are plain string values."
+  [spec]
+  (or (#{:map :map-of :vector :sequential :set :tuple} spec)
+      (and (vector? spec)
+           (#{:map :map-of :vector :sequential :set :tuple :or :and :maybe} (first spec)))))
+
+(defn spec->type-str
+  "Convert a Malli spec to a string type representation.
+  For complex types (maps, vectors, enums), returns a JSON-descriptive string."
+  [spec]
+  (cond
+    ;; Primitives
+    (= spec :string) "str"
+    (= spec :int) "int"
+    (= spec :double) "float"
+    (= spec :float) "float"
+    (= spec :boolean) "bool"
+    (= spec :any) "any"
+    (= spec 'string?) "str"
+    (= spec 'int?) "int"
+    (= spec 'double?) "float"
+    (= spec 'float?) "float"
+    (= spec 'boolean?) "bool"
+
+    ;; Bare keyword complex types
+    (= spec :map) "json object"
+    (= spec :map-of) "json object"
+    (= spec :vector) "json array"
+    (= spec :sequential) "json array"
+    (= spec :set) "json array (unique items)"
+    (= spec :tuple) "json array"
+
+    ;; Map - describe fields as JSON object
+    (and (vector? spec) (= :map (first spec)))
+    (let [fields (filter vector? (rest spec))
+          field-strs (for [[k & rest] fields
+                           :let [opts (when (map? (first rest)) (first rest))
+                                 field-spec (if opts (second rest) (first rest))
+                                 optional? (:optional opts)]]
+                       (str (name k) (when optional? "?") ": " (spec->type-str field-spec)))]
+      (str "json {" (str/join ", " field-strs) "}"))
+
+    ;; Map-of - describe as JSON object with dynamic keys
+    (and (vector? spec) (= :map-of (first spec)))
+    (let [[_ key-spec val-spec] spec]
+      (str "json object with " (spec->type-str key-spec) " keys and " (spec->type-str val-spec) " values"))
+
+    ;; Vector/sequential - describe as JSON array
+    (and (vector? spec) (#{:vector :sequential} (first spec)))
+    (str "json array of " (spec->type-str (second spec)))
+
+    ;; Enum - list options
+    (and (vector? spec) (= :enum (first spec)))
+    (str "one of: " (str/join ", " (map str (rest spec))))
+
+    ;; Maybe - nullable
+    (and (vector? spec) (= :maybe (first spec)))
+    (str (spec->type-str (second spec)) " or null")
+
+    ;; Wrapped specs like [:string {:min 1}] - recurse on first element
+    (vector? spec) (spec->type-str (first spec))
+
+    :else "str"))
+
+(defn validate-field
+  "Validate a single field value against its Malli spec.
+
+  Parameters:
+  - field: Field definition with :name, :spec, :description
+  - value: The value to validate
+
+  Returns value if valid, throws exception if invalid."
+  [field value]
+  (let [{:keys [name spec]} field]
+    (if (m/validate spec value)
+      value
+      (throw (ex-info (str "Validation failed for field " name)
+                      {:field name
+                       :spec spec
+                       :value value
+                       :errors (m/explain spec value)})))))
+
+(defn validate-inputs
+  "Validate all input fields against their Malli specs.
+
+  Parameters:
+  - fields: Vector of field definitions with :name, :spec, :description
+  - input-map: Map of field names to values
+
+  Image fields (:type :image) are skipped — their values are URLs/data URIs,
+  not schema-typed data.
+
+  Returns input-map if valid, throws exception if invalid."
+  [fields input-map]
+  (doseq [field fields]
+    (let [{:keys [name spec type]} field]
+      (when (and spec (not= type :image))
+        (when-let [value (get input-map name)]
+          (validate-field field value)))))
+  input-map)
+
+(defn validate-outputs
+  "Validate all output fields against their Malli specs.
+
+  Parameters:
+  - fields: Vector of field definitions with :name, :spec, :description
+  - output-map: Map of field names to values
+
+  Returns output-map if valid, throws exception if invalid."
+  [fields output-map]
+  (doseq [field fields]
+    (let [{:keys [name spec]} field]
+      (when spec
+        (when-let [value (get output-map name)]
+          (validate-field field value)))))
+  output-map)
+
+(defn- strip-markdown-code-block
+  "Strip markdown code block formatting from a string.
+   Handles ```json, ```JSON, ``` (plain), etc."
+  [s]
+  (let [trimmed (str/trim s)]
+    (if (str/starts-with? trimmed "```")
+      ;; Remove opening ``` with optional language identifier and closing ```
+      (let [;; Find end of first line (after ```json or similar)
+            first-newline (str/index-of trimmed "\n")
+            ;; Content starts after first newline
+            content-start (if first-newline (inc first-newline) 3)
+            ;; Find closing ```
+            closing-idx (str/last-index-of trimmed "```")
+            ;; Extract content between markers
+            content (if (and closing-idx (> closing-idx content-start))
+                      (subs trimmed content-start closing-idx)
+                      (subs trimmed content-start))]
+        (str/trim content))
+      trimmed)))
+
+(defn- parse-json-value
+  "Parse a string as JSON if it looks like JSON (starts with { or [).
+  Handles markdown code block formatting (```json ... ```).
+  Returns the parsed Clojure data structure, or the original value if parsing fails."
+  [value]
+  (when value
+    (let [trimmed (str/trim value)
+          ;; Strip markdown code blocks if present
+          cleaned (strip-markdown-code-block trimmed)]
+      (if (or (str/starts-with? cleaned "{")
+              (str/starts-with? cleaned "["))
+        (try
+          (json/read-str cleaned :key-fn keyword)
+          (catch Exception _e
+            ;; Return original value if JSON parsing fails
+            value))
+        ;; Not JSON, return as-is
+        value))))
+
+;; =============================================================================
+;; JSON Schema Conversion (for function calling)
+;; =============================================================================
+
+(defn malli-spec->json-schema
+  "Convert a Malli spec to JSON Schema format for function calling parameters.
+
+  Supports common Malli types: :string, :int, :double, :boolean, :enum, :map, :vector, etc."
+  [spec]
+  (cond
+    ;; Primitives
+    (= spec :string) {:type "string"}
+    (= spec :int) {:type "integer"}
+    (= spec :double) {:type "number"}
+    (= spec :float) {:type "number"}
+    (= spec :boolean) {:type "boolean"}
+    (= spec :any) {}
+    ;; Bare keyword complex types
+    (= spec :map) {:type "object"}
+    (= spec :map-of) {:type "object"}
+    (= spec :vector) {:type "array"}
+    (= spec :sequential) {:type "array"}
+    (= spec :set) {:type "array" :uniqueItems true}
+    (= spec :tuple) {:type "array"}
+    (= spec 'string?) {:type "string"}
+    (= spec 'int?) {:type "integer"}
+    (= spec 'double?) {:type "number"}
+    (= spec 'float?) {:type "number"}
+    (= spec 'boolean?) {:type "boolean"}
+
+    ;; Enum - list allowed values
+    (and (vector? spec) (= :enum (first spec)))
+    {:type "string" :enum (mapv str (rest spec))}
+
+    ;; Maybe - nullable
+    (and (vector? spec) (= :maybe (first spec)))
+    (let [inner (malli-spec->json-schema (second spec))]
+      (if (:type inner)
+        (assoc inner :nullable true)
+        inner))
+
+    ;; Map with explicit fields
+    (and (vector? spec) (= :map (first spec)))
+    (let [fields (filter vector? (rest spec))
+          required-fields (for [[k & rest] fields
+                                :let [opts (when (map? (first rest)) (first rest))
+                                      optional? (:optional opts)]
+                                :when (not optional?)]
+                            (name k))
+          properties (into {}
+                           (for [[k & rest] fields
+                                 :let [opts (when (map? (first rest)) (first rest))
+                                       field-spec (if opts (second rest) (first rest))]]
+                             [(name k) (malli-spec->json-schema field-spec)]))]
+      (cond-> {:type "object" :properties properties}
+        (seq required-fields) (assoc :required (vec required-fields))))
+
+    ;; Map-of - object with additionalProperties
+    (and (vector? spec) (= :map-of (first spec)))
+    {:type "object" :additionalProperties (malli-spec->json-schema (nth spec 2))}
+
+    ;; Vector/sequential - array
+    (and (vector? spec) (#{:vector :sequential} (first spec)))
+    {:type "array" :items (malli-spec->json-schema (second spec))}
+
+    ;; Set - array with unique items
+    (and (vector? spec) (= :set (first spec)))
+    {:type "array" :items (malli-spec->json-schema (second spec)) :uniqueItems true}
+
+    ;; Tuple - array with positional items
+    (and (vector? spec) (= :tuple (first spec)))
+    {:type "array" :items (mapv malli-spec->json-schema (rest spec))}
+
+    ;; Wrapped specs like [:string {:min 1}] - recurse on first element
+    (vector? spec)
+    (malli-spec->json-schema (first spec))
+
+    :else {:type "string"}))
+
+(defn outputs->tool-definition
+  "Convert a spec's outputs to a function-calling tool definition.
+
+  Creates a `submit_response` tool that accepts all output fields as parameters,
+  suitable for providers that support structured output via function calling."
+  [spec]
+  (let [{:keys [outputs instructions]} spec
+        properties (into {}
+                         (for [{:keys [name spec description]} outputs]
+                           [(clojure.core/name name)
+                            (cond-> (malli-spec->json-schema spec)
+                              description (assoc :description description))]))
+        required (mapv #(clojure.core/name (:name %)) outputs)]
+    {:type "function"
+     :function {:name "submit_response"
+                :description (or instructions "Submit the structured response")
+                :parameters {:type "object"
+                             :properties properties
+                             :required required}}}))
+
+(defn parse-tool-call-response
+  "Parse a function-calling response from an LLM into a map of output values.
+
+  Reads the first tool call's JSON arguments and maps them onto the given
+  `outputs` field definitions (keyed by field :name). Returns nil if there is
+  no tool call, or a map of {output-field-name value} otherwise.
+
+  Parameters:
+  - response: The provider response map (expects
+              [:choices 0 :message :tool-calls 0 :function :arguments])
+  - outputs: Vector of output field definitions"
+  [response outputs]
+  (let [tool-calls (-> response :choices first :message :tool-calls)
+        first-call (first tool-calls)]
+    (when first-call
+      (let [arguments-str (-> first-call :function :arguments)
+            parsed (try
+                     (json/read-str arguments-str :key-fn keyword)
+                     (catch Exception _e nil))]
+        ;; Convert string keys to keyword keys matching output names
+        (when parsed
+          (into {}
+                (for [{:keys [name]} outputs
+                      :let [k (keyword (clojure.core/name name))
+                            v (get parsed k (get parsed (clojure.core/name name)))]]
+                  [name v])))))))
+
+;; =============================================================================
+;; Prompt Rendering
+;; =============================================================================
+
+(defn spec->prompt
+  "Render a spec (I/O contract) into a prompt template.
+
+  A spec is a map with:
+  - :inputs - Vector of field definitions with :name, :spec, :description keys
+  - :outputs - Vector of field definitions with :name, :spec, :description keys
+  - :instructions - Optional string describing the task instructions, rules, and examples
+
+  The rendered prompt uses DSPy-style field markers ([[ ## field ## ]]) and
+  emits per-type notes (booleans, enums, JSON) for the output fields. Image
+  inputs (:type :image) are omitted from the text template — send them as
+  content parts via `build-message-content`.
+
+  Returns a formatted prompt string."
+  [spec]
+  (let [{:keys [inputs outputs instructions]} spec
+        format-field (fn [idx {:keys [name spec description]}]
+                       (let [type-str (spec->type-str spec)]
+                         (str (inc idx) ". `" (clojure.core/name name) "` (" type-str "): " description)))
+
+        ;; Input fields section (exclude image inputs — they're sent as content parts, not text)
+        text-inputs (remove #(= :image (:type %)) inputs)
+        input-section (when (seq text-inputs)
+                        (str "Your input fields are:\n"
+                             (str/join "\n" (map-indexed format-field text-inputs))))
+
+        ;; Output fields section
+        output-section (when (seq outputs)
+                         (str "Your output fields are:\n"
+                              (str/join "\n" (map-indexed format-field outputs))))
+
+        ;; Interaction format section (includes both inputs and outputs, excluding image inputs)
+        non-image-inputs (remove #(= :image (:type %)) inputs)
+        interaction-format (when (or (seq non-image-inputs) (seq outputs))
+                             (str "All interactions will be structured in the following way, with the appropriate values filled in.\n\n"
+                                  (str/join "\n\n"
+                                    (concat
+                                      (for [{:keys [name]} non-image-inputs]
+                                        (str "[[ ## " (clojure.core/name name) " ## ]]\n"
+                                             "{" (clojure.core/name name) "}"))
+                                      (for [{:keys [name spec]} outputs]
+                                        (let [type-str (spec->type-str spec)]
+                                          (str "[[ ## " (clojure.core/name name) " ## ]]\n"
+                                               "{" (clojure.core/name name) "}"
+                                               (cond
+                                                 (= type-str "bool")
+                                                 "        # note: the value you produce must be True or False"
+
+                                                 (and (vector? spec) (= :enum (first spec)))
+                                                 "        # note: respond with just the value, no quotes"
+
+                                                 (complex-spec? spec)
+                                                 "        # note: respond with valid JSON"
+
+                                                 :else ""))))))))
+
+        ;; Instructions section
+        instructions-section (when instructions
+                               (str "[[ ## completed ## ]]\n"
+                                    "In adhering to this structure, your instructions are: " instructions))
+
+        ;; Combine all sections
+        sections (filter some? [input-section output-section interaction-format instructions-section])]
+    (str/join "\n" sections)))
+
+(defn build-message-content
+  "Build message content for an LLM call, supporting multimodal inputs.
+  If the spec has any inputs with :type :image, returns a vector of content
+  parts (text + images) in the OpenAI content-parts shape. Otherwise returns
+  the prompt as a plain string.
+
+  Parameters:
+  - spec: The spec with :inputs (image inputs are pulled from input-map by name)
+  - prompt: The rendered text prompt (with input values already injected)
+  - input-map: Map of input field names to values; image fields may hold a
+               single URL/data-URI or a sequence of them"
+  [spec prompt input-map]
+  (let [image-inputs (filter #(= :image (:type %)) (:inputs spec))]
+    (if (empty? image-inputs)
+      prompt
+      (let [image-parts (for [{:keys [name]} image-inputs
+                              :let [v (get input-map name)]
+                              :when v
+                              img (if (sequential? v) v [v])]
+                          {:type "image_url" :image_url {:url img}})]
+        (into [{:type "text" :text prompt}] image-parts)))))
+
+;; =============================================================================
+;; Output Parsing
+;; =============================================================================
+
+(defn- strip-completion-marker
+  "Remove the [[ ## completed ## ]] marker and anything after it from a string."
+  [s]
+  (when s
+    (-> s
+        (str/replace #"\[\[\s*##\s*completed\s*##\s*\]\].*$" "")
+        (str/trim))))
+
+(defn parse-output
+  "Parse LLM output based on a spec's output field definitions.
+
+  Parameters:
+  - response: The LLM response string
+  - spec: The spec with :outputs
+
+  Returns a map with output field names as keys and parsed, type-coerced values.
+  For complex specs (maps, vectors), parses JSON responses; booleans/ints/floats
+  are coerced from their string form; enums stay plain strings.
+
+  Single-field fallback: when a spec has exactly one string-typed output and the
+  model wrote plain prose without the field markers, the whole response becomes
+  that field's value. Multi-field specs stay strict.
+
+  Example:
+    (parse-output llm-response {:outputs [{:name :answer :spec :string}
+                                          {:name :confidence :spec :boolean}]})"
+  [response {:keys [outputs]}]
+  (let [;; Extract content between [[ ## field_name ## ]] or [[##field_name##]] markers
+        extract-field (fn [field-name text]
+                        (let [pattern (re-pattern (str "\\[\\[\\s*##\\s*" (name field-name) "\\s*##\\s*\\]\\]\\s*\\n([\\s\\S]*?)(?=\\n\\[\\[\\s*##|$)"))
+                              match (re-find pattern text)]
+                          (when match
+                            (-> (second match)
+                                (str/trim)
+                                (strip-completion-marker)))))
+
+        ;; Get base type from spec (unwrap [:string {:min 1}] -> :string)
+        base-type (fn [spec]
+                    (if (and (vector? spec) (not (complex-spec? spec)))
+                      (first spec)
+                      spec))
+
+        ;; Convert string value to appropriate type based on spec
+        convert-value (fn [value spec]
+                        (let [base (base-type spec)]
+                          (cond
+                            (nil? value) nil
+
+                            ;; Complex specs - parse as JSON
+                            (complex-spec? spec)
+                            (parse-json-value value)
+
+                            ;; Booleans
+                            (#{:boolean 'boolean?} base)
+                            (contains? #{"True" "true" "TRUE"} value)
+
+                            ;; Integers
+                            (#{:int 'int?} base)
+                            (try (Long/parseLong value) (catch Exception _ value))
+
+                            ;; Floats
+                            (#{:double :float 'double? 'float?} base)
+                            (try (Double/parseDouble value) (catch Exception _ value))
+
+                            :else value)))
+        parsed (into {}
+                     (for [{:keys [name spec]} outputs]
+                       (let [raw-value (extract-field name response)
+                             converted-value (convert-value raw-value spec)]
+                         [name converted-value])))]
+    ;; Single-field fallback: models answering a one-output-field spec
+    ;; often write plain prose and skip the field markers entirely —
+    ;; especially under long task instructions. When that single field is
+    ;; string-typed, treat the whole response as its value rather than
+    ;; returning nil. Multi-field specs stay strict (no way to split
+    ;; unmarked text). This is also what makes single-field specs
+    ;; reliably streamable: progressive parses yield text-so-far from the
+    ;; first delta.
+    (let [single (when (= 1 (count outputs)) (first outputs))
+          single-base (when single
+                        (let [spec (:spec single)]
+                          (if (and (vector? spec) (not (complex-spec? spec)))
+                            (first spec)
+                            spec)))]
+      (if (and single
+               (contains? #{:string 'string? nil} single-base)
+               (every? nil? (vals parsed))
+               (string? response)
+               (not (str/blank? response)))
+        {(:name single) (-> response str/trim strip-completion-marker)}
+        parsed))))
+
+;; =============================================================================
+;; Streaming Parse Helpers (pure — no channels, no provider)
+;; =============================================================================
+
+(defn- parse-json-elem
+  "Parse one top-level element substring of a JSON array as JSON.
+  Returns the decoded value, or nil if the substring is not valid JSON (e.g. a
+  still-incomplete element). Never evaluates code."
+  [t]
+  (try (json/read-str (str/trim t) :key-fn keyword)
+       (catch Exception _ nil)))
+
+(defn parse-streaming-json-array
+  "Progressively parse a JSON array from accumulated (possibly incomplete) text.
+
+  Returns a vector of the COMPLETE top-level items decoded so far; a trailing
+  item that is still being streamed is omitted, so the vector grows as more
+  text arrives. Returns [] before any array has started.
+
+  Safe on untrusted model text: it scans for element boundaries with a
+  string/escape-aware depth counter (so brackets and commas inside JSON strings
+  and nested arrays/objects are handled correctly) and decodes each complete
+  element with clojure.data.json — it never uses the Clojure reader, so a #=(...)
+  reader macro in the text cannot execute code."
+  [accumulated-text]
+  (let [^String s (or accumulated-text "")
+        open (str/index-of s "[")
+        n (count s)]
+    (if (nil? open)
+      []
+      (loop [i (inc open)          ; scanning position, just past the opening [
+             depth 1               ; nesting depth; 1 == top level inside the array
+             in-str? false         ; are we inside a JSON string literal?
+             escaped? false        ; was the previous char an unescaped backslash?
+             elem-start nil        ; start index of the element currently being read
+             complete (transient [])] ; substrings of fully-delimited elements
+        (if (>= i n)
+          ;; Input ran out mid-element — decode only the fully-delimited ones.
+          (into [] (keep parse-json-elem (persistent! complete)))
+          (let [c (.charAt s i)]
+            (cond
+              ;; Inside a string: only an unescaped quote can end it.
+              in-str?
+              (recur (inc i) depth
+                     (if (and (= c \") (not escaped?)) false true)
+                     (and (not escaped?) (= c \\))
+                     elem-start complete)
+
+              (= c \")
+              (recur (inc i) depth true false (or elem-start i) complete)
+
+              (or (= c \{) (= c \[))
+              (recur (inc i) (inc depth) false false (or elem-start i) complete)
+
+              (or (= c \}) (= c \]))
+              (let [d (dec depth)]
+                (if (zero? d)
+                  ;; Closing bracket of the array: finalize the current element.
+                  (let [complete' (if elem-start
+                                    (conj! complete (subs s elem-start i))
+                                    complete)]
+                    (into [] (keep parse-json-elem (persistent! complete'))))
+                  (recur (inc i) d false false (or elem-start i) complete)))
+
+              ;; Top-level comma: the current element is complete.
+              (and (= c \,) (= depth 1))
+              (recur (inc i) depth false false nil
+                     (if elem-start (conj! complete (subs s elem-start i)) complete))
+
+              ;; First non-whitespace char of a new element.
+              (and (nil? elem-start) (not (Character/isWhitespace c)))
+              (recur (inc i) depth false false i complete)
+
+              :else
+              (recur (inc i) depth false false elem-start complete))))))))
+
+(defn parse-streaming-output
+  "Parse streaming LLM output progressively.
+
+  Parameters:
+  - accumulated-text: The accumulated response text so far
+  - spec: The spec with :outputs
+
+  Returns parsed output, which may be partial/incomplete. This is just
+  `parse-output` applied to the text accumulated so far — pair it with your own
+  streaming loop (e.g. over a stream of provider chunks)."
+  [accumulated-text spec]
+  (parse-output accumulated-text spec))
