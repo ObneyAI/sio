@@ -12,7 +12,7 @@ declare a typed **spec** — the input/output contract — and `sio`:
 - **emits** function-calling tool definitions for providers that support them.
 
 `sio` is deliberately **provider-agnostic**: it never makes an LLM call. Bring
-your own client — [litellm-clj](https://github.com/ObneyAI/litellm-clj), a raw
+your own client — [litellm-clj](https://github.com/unravel-team/litellm-clj), a raw
 HTTP request, anything. `sio` gives you the prompt to send and turns whatever
 comes back into validated data.
 
