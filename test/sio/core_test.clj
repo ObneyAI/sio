@@ -502,7 +502,25 @@
     (is (= {:type "array"} (sio/malli-spec->json-schema :vector)))
     (is (= {:type "array"} (sio/malli-spec->json-schema :sequential)))
     (is (= {:type "array" :uniqueItems true} (sio/malli-spec->json-schema :set)))
-    (is (= {:type "array"} (sio/malli-spec->json-schema :tuple)))))
+    (is (= {:type "array"} (sio/malli-spec->json-schema :tuple))))
+
+  (testing "Composite schemas tolerate a leading Malli properties map (spec-children)"
+    ;; Without the spec-children fix, the props map is mistaken for the child
+    ;; schema and the element type collapses to string / leaks into the output.
+    (is (= {:type "array" :items {:type "integer"}}
+           (sio/malli-spec->json-schema [:vector {:description "x"} :int])))
+    (is (= {:type "array" :items {:type "integer"}}
+           (sio/malli-spec->json-schema [:sequential {:description "x"} :int])))
+    (is (= {:type "array" :items {:type "integer"} :uniqueItems true}
+           (sio/malli-spec->json-schema [:set {:description "x"} :int])))
+    (is (= {:type "object" :additionalProperties {:type "integer"}}
+           (sio/malli-spec->json-schema [:map-of {:description "x"} :string :int])))
+    (is (= {:type "string" :enum ["a" "b"]}
+           (sio/malli-spec->json-schema [:enum {:description "x"} "a" "b"])))
+    (is (= {:type "integer" :nullable true}
+           (sio/malli-spec->json-schema [:maybe {:description "x"} :int])))
+    (is (= {:type "array" :items [{:type "string"} {:type "integer"}]}
+           (sio/malli-spec->json-schema [:tuple {:description "x"} :string :int])))))
 
 (deftest outputs->tool-definition-test
   (testing "Creates valid tool definition from simple output"

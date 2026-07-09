@@ -16,9 +16,9 @@ your own client — [litellm-clj](https://github.com/ObneyAI/litellm-clj), a raw
 HTTP request, anything. `sio` gives you the prompt to send and turns whatever
 comes back into validated data.
 
-> `sio` was extracted from the [DSPy](https://github.com/stanfordnlp/dspy)-inspired
-> DSCloj, keeping only its structured-I/O core and dropping the provider/router
-> and `predict` machinery.
+> `sio` follows the [DSPy](https://github.com/stanfordnlp/dspy) signature model —
+> a declarative, typed I/O contract — but stays deliberately small: just the
+> structured-I/O core, with no provider/router or LLM-calling machinery.
 
 ## Installation
 

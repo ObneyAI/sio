@@ -207,10 +207,21 @@
 ;; JSON Schema Conversion (for function calling)
 ;; =============================================================================
 
+(defn- spec-children
+  "Child schemas of a composite Malli spec, skipping a leading properties/options map.
+   Malli allows properties as the second element of any schema, e.g.
+   [:vector {:description \"...\"} item]. Without this, callers that take `(second spec)`
+   as the child would grab the options map instead of the real child schema (producing,
+   for a vector, `items {:type \"string\"}` — i.e. 'array of strings' — for ANY item type)."
+  [spec]
+  (let [args (rest spec)]
+    (if (map? (first args)) (rest args) args)))
+
 (defn malli-spec->json-schema
   "Convert a Malli spec to JSON Schema format for function calling parameters.
 
-  Supports common Malli types: :string, :int, :double, :boolean, :enum, :map, :vector, etc."
+  Supports common Malli types: :string, :int, :double, :boolean, :enum, :map, :vector, etc.
+  Collection/composite schemas tolerate a leading properties map (see `spec-children`)."
   [spec]
   (cond
     ;; Primitives
@@ -235,11 +246,11 @@
 
     ;; Enum - list allowed values
     (and (vector? spec) (= :enum (first spec)))
-    {:type "string" :enum (mapv str (rest spec))}
+    {:type "string" :enum (mapv str (spec-children spec))}
 
     ;; Maybe - nullable
     (and (vector? spec) (= :maybe (first spec)))
-    (let [inner (malli-spec->json-schema (second spec))]
+    (let [inner (malli-spec->json-schema (first (spec-children spec)))]
       (if (:type inner)
         (assoc inner :nullable true)
         inner))
@@ -262,19 +273,19 @@
 
     ;; Map-of - object with additionalProperties
     (and (vector? spec) (= :map-of (first spec)))
-    {:type "object" :additionalProperties (malli-spec->json-schema (nth spec 2))}
+    {:type "object" :additionalProperties (malli-spec->json-schema (second (spec-children spec)))}
 
     ;; Vector/sequential - array
     (and (vector? spec) (#{:vector :sequential} (first spec)))
-    {:type "array" :items (malli-spec->json-schema (second spec))}
+    {:type "array" :items (malli-spec->json-schema (first (spec-children spec)))}
 
     ;; Set - array with unique items
     (and (vector? spec) (= :set (first spec)))
-    {:type "array" :items (malli-spec->json-schema (second spec)) :uniqueItems true}
+    {:type "array" :items (malli-spec->json-schema (first (spec-children spec))) :uniqueItems true}
 
     ;; Tuple - array with positional items
     (and (vector? spec) (= :tuple (first spec)))
-    {:type "array" :items (mapv malli-spec->json-schema (rest spec))}
+    {:type "array" :items (mapv malli-spec->json-schema (spec-children spec))}
 
     ;; Wrapped specs like [:string {:min 1}] - recurse on first element
     (vector? spec)
