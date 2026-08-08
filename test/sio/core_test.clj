@@ -443,7 +443,39 @@
 
   (testing "Enum converts to JSON Schema with allowed values"
     (is (= {:type "string" :enum ["a" "b" "c"]}
-           (sio/malli-spec->json-schema [:enum "a" "b" "c"]))))
+           (sio/malli-spec->json-schema [:enum "a" "b" "c"])))
+    (is (= {:type "string" :enum ["unchanged" "changed"]}
+           (sio/malli-spec->json-schema [:enum :unchanged :changed])))
+    (is (= {:type "string" :enum ["decision/unchanged" "decision/changed"]}
+           (sio/malli-spec->json-schema
+            [:enum :decision/unchanged :decision/changed])))
+    (is (= {:type "string" :enum [":unchanged" "changed"]}
+           (sio/malli-spec->json-schema [:enum ":unchanged" "changed"]))))
+
+  (testing "Literal values convert to JSON Schema constants"
+    (is (= {:const "invoke"}
+           (sio/malli-spec->json-schema [:= :invoke])))
+    (is (= {:const "decision/invoke"}
+           (sio/malli-spec->json-schema [:= :decision/invoke])))
+    (is (= {:const ":invoke"}
+           (sio/malli-spec->json-schema [:= ":invoke"])))
+    (is (= {:const false}
+           (sio/malli-spec->json-schema [:= false]))))
+
+  (testing "Or converts every structured alternative"
+    (is (= {:oneOf
+            [{:type "object"
+              :properties {"action" {:const "invoke"}
+                           "capability" {:type "string"}}
+              :required ["action" "capability"]}
+             {:type "object"
+              :properties {"action" {:const "respond"}
+                           "message" {:type "string"}}
+              :required ["action" "message"]}]}
+           (sio/malli-spec->json-schema
+            [:or
+             [:map [:action [:= :invoke]] [:capability :string]]
+             [:map [:action [:= :respond]] [:message :string]]]))))
 
   (testing "Maybe converts to nullable"
     (is (= {:type "string" :nullable true}
@@ -554,6 +586,38 @@
       (is (= "object" (get-in tool-def [:function :parameters :properties "data" :type])))
       (is (= {:type "array" :items {:type "string"}}
              (get-in tool-def [:function :parameters :properties "data" :properties "items"])))))
+
+  (testing "Uses canonical JSON spellings for keyword enum outputs"
+    (let [spec {:outputs [{:name :outcome
+                           :spec [:enum :unchanged :changed]
+                           :description "Learning outcome"}]}
+          tool-def (sio/outputs->tool-definition spec)]
+      (is (= {:type "string"
+              :enum ["unchanged" "changed"]
+              :description "Learning outcome"}
+             (get-in tool-def
+                     [:function :parameters :properties "outcome"])))))
+
+  (testing "Keeps a root union of maps structured in the tool definition"
+    (let [spec {:outputs
+                [{:name :decision
+                  :spec [:or
+                         [:map
+                          [:action [:= :invoke]]
+                          [:capability :string]
+                          [:world-changing? :boolean]]
+                         [:map
+                          [:action [:= :respond]]
+                          [:message :string]]]}]}
+          decision-schema
+          (get-in (sio/outputs->tool-definition spec)
+                  [:function :parameters :properties "decision"])]
+      (is (nil? (:type decision-schema)))
+      (is (= 2 (count (:oneOf decision-schema))))
+      (is (every? #(= "object" (:type %)) (:oneOf decision-schema)))
+      (is (= {:const "invoke"}
+             (get-in decision-schema
+                     [:oneOf 0 :properties "action"])))))
 
   (testing "Uses default description when instructions not provided"
     (let [spec {:outputs [{:name :x :spec :string}]}
