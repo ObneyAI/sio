@@ -37,7 +37,8 @@
   and `parse-tool-call-response` reads the arguments back out."
   (:require [clojure.string :as str]
             [clojure.data.json :as json]
-            [malli.core :as m]))
+            [malli.core :as m]
+            [malli.json-schema :as mjs]))
 
 ;; =============================================================================
 ;; Malli Schema Support
@@ -207,108 +208,123 @@
 ;; JSON Schema Conversion (for function calling)
 ;; =============================================================================
 
-(defn- spec-children
-  "Child schemas of a composite Malli spec, skipping a leading properties/options map.
-   Malli allows properties as the second element of any schema, e.g.
-   [:vector {:description \"...\"} item]. Without this, callers that take `(second spec)`
-   as the child would grab the options map instead of the real child schema (producing,
-   for a vector, `items {:type \"string\"}` — i.e. 'array of strings' — for ANY item type)."
-  [spec]
-  (let [args (rest spec)]
-    (if (map? (first args)) (rest args) args)))
+(defn- keyword->json-string [value]
+  (if-let [keyword-ns (namespace value)]
+    (str keyword-ns "/" (name value))
+    (name value)))
 
-(defn- enum-value->json
-  "Render Malli enum and literal members using their canonical JSON representation."
-  [value]
-  (if (keyword? value)
-    (if-let [keyword-ns (namespace value)]
-      (str keyword-ns "/" (name value))
-      (name value))
-    value))
+(defn- json-compatible-schema [value]
+  (cond
+    (keyword? value) (keyword->json-string value)
+    (map? value) (into (empty value)
+                       (map (fn [[k v]]
+                              [k (if (#{:properties :definitions} k)
+                                   (into {}
+                                         (map (fn [[schema-k schema-v]]
+                                                [(if (keyword? schema-k)
+                                                   (keyword->json-string schema-k)
+                                                   schema-k)
+                                                 (json-compatible-schema schema-v)]))
+                                         v)
+                                   (json-compatible-schema v))]))
+                       value)
+    (vector? value) (mapv json-compatible-schema value)
+    (seq? value) (mapv json-compatible-schema value)
+    :else value))
+
+(defn- json-pointer->definition-key
+  "Decode a `#/definitions/...` JSON Pointer into its definitions-map key.
+   Per RFC 6901 `~1` decodes to `/` and `~0` to `~`, and `~1` must be decoded
+   first — a namespaced Malli ref like :t/addr arrives as `t~1addr`."
+  [pointer]
+  (-> pointer
+      (str/replace #"^#/definitions/" "")
+      (str/replace "~1" "/")
+      (str/replace "~0" "~")))
+
+(defn- inline-definitions
+  "Splice `:definitions` into the schema so it is self-contained.
+
+  Malli renders a registry reference as
+  `{:$ref \"#/definitions/x\" :definitions {\"x\" {...}}}`. The pointer addresses
+  the JSON Schema DOCUMENT ROOT, but a field's schema is nested at
+  `parameters.properties.<field>`, so the definitions map lands nested too and the
+  pointer can never resolve. Consumers pass the tool schema through untouched, so
+  an unresolvable pointer reaches the provider verbatim — and provider function-call
+  schema subsets (Gemini's, notably) do not reliably support `$ref` at all.
+
+  Resolution is RECURSIVE, because a definition may reference another; inlining only
+  the top level leaves nested refs dangling. A self-referential schema degrades to a
+  bare object rather than recursing forever, and an unknown pointer is left untouched
+  rather than silently becoming nil."
+  [schema]
+  (if-let [definitions (:definitions schema)]
+    (letfn [(resolve* [x seen]
+              (cond
+                (and (map? x) (:$ref x))
+                (let [k (json-pointer->definition-key (:$ref x))]
+                  (cond
+                    (contains? seen k) {:type "object"}
+                    (contains? definitions k) (resolve* (get definitions k) (conj seen k))
+                    :else x))
+                (map? x) (into (empty x) (map (fn [[k v]] [k (resolve* v seen)])) x)
+                (vector? x) (mapv #(resolve* % seen) x)
+                (seq? x) (mapv #(resolve* % seen) x)
+                :else x))]
+      (resolve* (dissoc schema :definitions) #{}))
+    schema))
+
+(def ^:private numeric-json-types #{"integer" "number"})
+
+(defn- redundant-numeric-union?
+  "Is this a union whose branches are all bare numeric types? JSON Schema's
+   `number` already admits integers, so integer|number is exactly `number`."
+  [branches]
+  (and (seq branches)
+       (every? (fn [b] (and (map? b)
+                            (= #{:type} (set (keys b)))
+                            (contains? numeric-json-types (:type b))))
+               branches)))
+
+(defn- collapse-numeric-unions
+  "Collapse a redundant numeric union into a single `{:type \"number\"}`.
+
+  Malli renders a Clojure-side `[:or :int :double]` — which exists so validation
+  accepts both a Long and a Double — as `{:anyOf [{:type \"integer\"} {:type
+  \"number\"}]}`. In JSON Schema that union is a no-op, and wrapping it in
+  `:maybe` nests a union inside a union:
+
+      {:oneOf [{:anyOf [{:type \"integer\"} {:type \"number\"}]} {:type \"null\"}]}
+
+  That is noise in the contract the model reads, and models comply with a plain
+  type more reliably than with nested unions. Collapsing changes nothing
+  semantically. A union that is not entirely numeric is left alone, and a lone
+  `{:type \"integer\"}` is never widened."
+  [schema]
+  (letfn [(collapse [x]
+            (cond
+              (map? x)
+              (let [x (into (empty x) (map (fn [[k v]] [k (collapse v)])) x)]
+                (if-let [branches (some #(when (redundant-numeric-union? (get x %)) (get x %))
+                                        [:anyOf :oneOf])]
+                  (-> x (dissoc :anyOf :oneOf) (assoc :type "number"))
+                  x))
+              (vector? x) (mapv collapse x)
+              (seq? x) (mapv collapse x)
+              :else x))]
+    (collapse schema)))
 
 (defn malli-spec->json-schema
   "Convert a Malli spec to JSON Schema format for function calling parameters.
 
-  Supports common Malli types: :string, :int, :double, :boolean, :enum, :map, :vector, etc.
-  Collection/composite schemas tolerate a leading properties map (see `spec-children`)."
+  Delegates conversion to Malli's JSON Schema transformer, inlines any registry
+  references so the result is self-contained (see `inline-definitions`), collapses
+  redundant numeric unions (see `collapse-numeric-unions`), then normalizes Clojure
+  keywords to their canonical JSON string representation."
   [spec]
-  (cond
-    ;; Primitives
-    (= spec :string) {:type "string"}
-    (= spec :int) {:type "integer"}
-    (= spec :double) {:type "number"}
-    (= spec :float) {:type "number"}
-    (= spec :boolean) {:type "boolean"}
-    (= spec :any) {}
-    ;; Bare keyword complex types
-    (= spec :map) {:type "object"}
-    (= spec :map-of) {:type "object"}
-    (= spec :vector) {:type "array"}
-    (= spec :sequential) {:type "array"}
-    (= spec :set) {:type "array" :uniqueItems true}
-    (= spec :tuple) {:type "array"}
-    (= spec 'string?) {:type "string"}
-    (= spec 'int?) {:type "integer"}
-    (= spec 'double?) {:type "number"}
-    (= spec 'float?) {:type "number"}
-    (= spec 'boolean?) {:type "boolean"}
-
-    ;; Enum - list allowed values
-    (and (vector? spec) (= :enum (first spec)))
-    {:type "string" :enum (mapv enum-value->json (spec-children spec))}
-
-    ;; Literal - require the exact JSON representation
-    (and (vector? spec) (= := (first spec)))
-    {:const (enum-value->json (first (spec-children spec)))}
-
-    ;; Union - preserve every alternative as a structured JSON Schema
-    (and (vector? spec) (= :or (first spec)))
-    {:oneOf (mapv malli-spec->json-schema (spec-children spec))}
-
-    ;; Maybe - nullable
-    (and (vector? spec) (= :maybe (first spec)))
-    (let [inner (malli-spec->json-schema (first (spec-children spec)))]
-      (if (:type inner)
-        (assoc inner :nullable true)
-        inner))
-
-    ;; Map with explicit fields
-    (and (vector? spec) (= :map (first spec)))
-    (let [fields (filter vector? (rest spec))
-          required-fields (for [[k & rest] fields
-                                :let [opts (when (map? (first rest)) (first rest))
-                                      optional? (:optional opts)]
-                                :when (not optional?)]
-                            (name k))
-          properties (into {}
-                           (for [[k & rest] fields
-                                 :let [opts (when (map? (first rest)) (first rest))
-                                       field-spec (if opts (second rest) (first rest))]]
-                             [(name k) (malli-spec->json-schema field-spec)]))]
-      (cond-> {:type "object" :properties properties}
-        (seq required-fields) (assoc :required (vec required-fields))))
-
-    ;; Map-of - object with additionalProperties
-    (and (vector? spec) (= :map-of (first spec)))
-    {:type "object" :additionalProperties (malli-spec->json-schema (second (spec-children spec)))}
-
-    ;; Vector/sequential - array
-    (and (vector? spec) (#{:vector :sequential} (first spec)))
-    {:type "array" :items (malli-spec->json-schema (first (spec-children spec)))}
-
-    ;; Set - array with unique items
-    (and (vector? spec) (= :set (first spec)))
-    {:type "array" :items (malli-spec->json-schema (first (spec-children spec))) :uniqueItems true}
-
-    ;; Tuple - array with positional items
-    (and (vector? spec) (= :tuple (first spec)))
-    {:type "array" :items (mapv malli-spec->json-schema (spec-children spec))}
-
-    ;; Wrapped specs like [:string {:min 1}] - recurse on first element
-    (vector? spec)
-    (malli-spec->json-schema (first spec))
-
-    :else {:type "string"}))
+  (json-compatible-schema
+   (collapse-numeric-unions
+    (inline-definitions (mjs/transform spec)))))
 
 (defn outputs->tool-definition
   "Convert a spec's outputs to a function-calling tool definition.

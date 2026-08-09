@@ -463,7 +463,7 @@
            (sio/malli-spec->json-schema [:= false]))))
 
   (testing "Or converts every structured alternative"
-    (is (= {:oneOf
+    (is (= {:anyOf
             [{:type "object"
               :properties {"action" {:const "invoke"}
                            "capability" {:type "string"}}
@@ -477,8 +477,8 @@
              [:map [:action [:= :invoke]] [:capability :string]]
              [:map [:action [:= :respond]] [:message :string]]]))))
 
-  (testing "Maybe converts to nullable"
-    (is (= {:type "string" :nullable true}
+  (testing "Maybe converts to a JSON Schema null union"
+    (is (= {:oneOf [{:type "string"} {:type "null"}]}
            (sio/malli-spec->json-schema [:maybe :string]))))
 
   (testing "Map converts to object with properties"
@@ -520,38 +520,47 @@
       (is (= "object" (get-in schema [:properties "user" :type])))
       (is (= {:type "string"} (get-in schema [:properties "user" :properties "name"])))))
 
-  (testing "Wrapped specs unwrap correctly"
-    (is (= {:type "string"}
+  (testing "Schema constraints are preserved"
+    (is (= {:type "string" :minLength 1}
            (sio/malli-spec->json-schema [:string {:min 1}]))))
 
   (testing "Tuple converts to array with positional items"
-    (is (= {:type "array" :items [{:type "string"} {:type "integer"}]}
+    (is (= {:type "array"
+            :items [{:type "string"} {:type "integer"}]
+            :additionalItems false}
            (sio/malli-spec->json-schema [:tuple :string :int]))))
 
-  (testing "Bare keyword complex types convert"
-    (is (= {:type "object"} (sio/malli-spec->json-schema :map)))
-    (is (= {:type "object"} (sio/malli-spec->json-schema :map-of)))
-    (is (= {:type "array"} (sio/malli-spec->json-schema :vector)))
-    (is (= {:type "array"} (sio/malli-spec->json-schema :sequential)))
-    (is (= {:type "array" :uniqueItems true} (sio/malli-spec->json-schema :set)))
-    (is (= {:type "array"} (sio/malli-spec->json-schema :tuple))))
+  (testing "Bare schemas follow Malli's arity requirements"
+    (is (= {:type "object" :properties {}}
+           (sio/malli-spec->json-schema :map)))
+    (is (= {:type "array" :items [] :additionalItems false}
+           (sio/malli-spec->json-schema :tuple)))
+    (is (thrown? Exception (sio/malli-spec->json-schema :map-of)))
+    (is (thrown? Exception (sio/malli-spec->json-schema :vector)))
+    (is (thrown? Exception (sio/malli-spec->json-schema :sequential)))
+    (is (thrown? Exception (sio/malli-spec->json-schema :set))))
 
   (testing "Composite schemas tolerate a leading Malli properties map (spec-children)"
     ;; Without the spec-children fix, the props map is mistaken for the child
     ;; schema and the element type collapses to string / leaks into the output.
-    (is (= {:type "array" :items {:type "integer"}}
+    ;; The point of these cases is the CHILD TYPE (items/additionalProperties)
+    ;; surviving the leading props map. The props map's :description is now also
+    ;; carried onto the emitted schema — see
+    ;; malli-description-properties-reach-the-json-schema-test.
+    (is (= {:type "array" :items {:type "integer"} :description "x"}
            (sio/malli-spec->json-schema [:vector {:description "x"} :int])))
-    (is (= {:type "array" :items {:type "integer"}}
+    (is (= {:type "array" :items {:type "integer"} :description "x"}
            (sio/malli-spec->json-schema [:sequential {:description "x"} :int])))
-    (is (= {:type "array" :items {:type "integer"} :uniqueItems true}
+    (is (= {:type "array" :items {:type "integer"} :uniqueItems true :description "x"}
            (sio/malli-spec->json-schema [:set {:description "x"} :int])))
-    (is (= {:type "object" :additionalProperties {:type "integer"}}
+    (is (= {:type "object" :additionalProperties {:type "integer"} :description "x"}
            (sio/malli-spec->json-schema [:map-of {:description "x"} :string :int])))
-    (is (= {:type "string" :enum ["a" "b"]}
+    (is (= {:type "string" :enum ["a" "b"] :description "x"}
            (sio/malli-spec->json-schema [:enum {:description "x"} "a" "b"])))
-    (is (= {:type "integer" :nullable true}
+    (is (= {:oneOf [{:type "integer"} {:type "null"}] :description "x"}
            (sio/malli-spec->json-schema [:maybe {:description "x"} :int])))
-    (is (= {:type "array" :items [{:type "string"} {:type "integer"}]}
+    (is (= {:type "array" :items [{:type "string"} {:type "integer"}]
+            :additionalItems false :description "x"}
            (sio/malli-spec->json-schema [:tuple {:description "x"} :string :int])))))
 
 (deftest outputs->tool-definition-test
@@ -613,11 +622,11 @@
           (get-in (sio/outputs->tool-definition spec)
                   [:function :parameters :properties "decision"])]
       (is (nil? (:type decision-schema)))
-      (is (= 2 (count (:oneOf decision-schema))))
-      (is (every? #(= "object" (:type %)) (:oneOf decision-schema)))
+      (is (= 2 (count (:anyOf decision-schema))))
+      (is (every? #(= "object" (:type %)) (:anyOf decision-schema)))
       (is (= {:const "invoke"}
              (get-in decision-schema
-                     [:oneOf 0 :properties "action"])))))
+                     [:anyOf 0 :properties "action"])))))
 
   (testing "Uses default description when instructions not provided"
     (let [spec {:outputs [{:name :x :spec :string}]}
@@ -775,3 +784,175 @@
       (is (= [] (sio/parse-streaming-json-array
                  "[#=(spit \"/tmp/sio-rce-should-not-exist\" \"x\")]")))
       (is (not (.exists marker)) "reader macro must not have executed"))))
+
+;; ===========================================================================
+;; Malli :description properties must survive into the provider-facing schema.
+;;
+;; The hand-rolled converter previously ignored a schema's properties map, so
+;; [:string {:description "..."}] fell through the "wrapped spec — recurse on
+;; the first element" branch and emitted a bare {:type "string"}. Any guidance
+;; authored below the top level of a function-calling output silently vanished
+;; from what the model was shown, with no error. malli's own json-schema
+;; transformer emits these, so this was also a divergence from Malli semantics.
+;; ===========================================================================
+
+(deftest malli-description-properties-reach-the-json-schema-test
+  (testing "A primitive carries its :description"
+    (is (= {:type "string" :description "The student's verbatim quote."}
+           (sio/malli-spec->json-schema
+            [:string {:description "The student's verbatim quote."}]))))
+
+  (testing "A collection carries its :description (and keeps its item type)"
+    (is (= {:type "array" :items {:type "string"}
+            :description "3-5 specific factors that influenced this score."}
+           (sio/malli-spec->json-schema
+            [:vector {:description "3-5 specific factors that influenced this score."}
+             :string]))))
+
+  (testing "A union carries its :description"
+    (is (= "Score from 0.0 to 1.0"
+           (:description (sio/malli-spec->json-schema
+                          [:or {:description "Score from 0.0 to 1.0"} :int :double])))))
+
+  (testing "A :maybe carries its :description alongside its null union"
+    (let [s (sio/malli-spec->json-schema [:maybe {:description "ACT, or null."} :int])]
+      (is (= [{:type "integer"} {:type "null"}] (:oneOf s)))
+      (is (= "ACT, or null." (:description s)))))
+
+  (testing "NESTED descriptions survive — the actual regression"
+    (let [s (sio/malli-spec->json-schema
+             [:map {:description "Multi-dimension scoring for ONE program."}
+              [:reasoning [:string {:description "2-3 sentences, produced BEFORE the score."}]]
+              [:score [:or {:description "Financial fit 0.0-1.0; use net tuition, NOT raw tuition."}
+                       :int :double]]
+              [:key-factors [:vector {:description "3-5 specific factors."} :string]]])]
+      (is (= "Multi-dimension scoring for ONE program." (:description s)))
+      (is (= "2-3 sentences, produced BEFORE the score."
+             (get-in s [:properties "reasoning" :description])))
+      (is (= "Financial fit 0.0-1.0; use net tuition, NOT raw tuition."
+             (get-in s [:properties "score" :description])))
+      (is (= "3-5 specific factors."
+             (get-in s [:properties "key-factors" :description])))))
+
+  (testing "Descriptions on map entries survive"
+    (is (= "Confidence from 0.0 to 1.0"
+           (get-in (sio/malli-spec->json-schema
+                    [:map
+                     [:score {:description "Confidence from 0.0 to 1.0"}
+                      :double]])
+                   [:properties "score" :description]))))
+
+  (testing "Nested descriptions reach the function-calling tool definition"
+    (let [tool (sio/outputs->tool-definition
+                {:instructions "Score this program."
+                 :outputs [{:name :financial
+                            :spec [:map [:score [:or {:description "Use net tuition, NOT raw tuition."}
+                                                 :int :double]]]}]})
+          score (get-in tool [:function :parameters :properties "financial"
+                              :properties "score"])]
+      (is (= "Use net tuition, NOT raw tuition." (:description score)))))
+
+  (testing "An explicit field :description still wins over the schema's own"
+    (let [tool (sio/outputs->tool-definition
+                {:outputs [{:name :answer
+                            :spec [:string {:description "from schema"}]
+                            :description "from field"}]})]
+      (is (= "from field"
+             (get-in tool [:function :parameters :properties "answer" :description])))))
+
+  (testing "Other Malli properties are preserved without adding a description"
+    (is (= {:type "string" :minLength 1}
+           (sio/malli-spec->json-schema [:string {:min 1}])))
+    (is (= {:type "array" :items {:type "string"} :minItems 1}
+           (sio/malli-spec->json-schema [:vector {:min 1} :string])))
+    (is (= {:type "string" :enum ["a" "b"]}
+           (sio/malli-spec->json-schema [:enum "a" "b"])))
+    (is (= {:const false} (sio/malli-spec->json-schema [:= false])))))
+
+;; ===========================================================================
+;; Registry refs must be INLINED, not emitted as $ref/definitions.
+;;
+;; Malli's transformer emits {"$ref" "#/definitions/foo" "definitions" {...}}
+;; for a registry reference. That pointer addresses the DOCUMENT ROOT, but a
+;; field's schema is nested at parameters.properties.<field>, so the definitions
+;; map lands nested too and the pointer cannot resolve. Consumers pass the tool
+;; schema through untouched (litellm's transform-tools moves :parameters by
+;; identity), so an unresolvable pointer reaches the provider verbatim — and
+;; Gemini's function-declaration subset does not reliably support $ref at all.
+;;
+;; Inlining also has to be RECURSIVE: resolving only the top level leaves nested
+;; refs behind, which looks correct on the first field you inspect.
+;; ===========================================================================
+
+(def ^:private flat-ref-spec
+  [:schema {:registry {:t/addr [:map [:street :string]]}} :t/addr])
+
+(def ^:private nested-ref-spec
+  [:schema {:registry {:t/addr [:map [:street :string]]
+                       :t/person [:map [:name :string] [:address :t/addr]]}}
+   :t/person])
+
+(deftest registry-refs-are-inlined-test
+  (testing "a top-level registry ref is replaced by its target"
+    (is (= {:type "object"
+            :properties {"street" {:type "string"}}
+            :required ["street"]}
+           (sio/malli-spec->json-schema flat-ref-spec))))
+
+  (testing "a NESTED registry ref is inlined too (one level of deref is not enough)"
+    (let [s (sio/malli-spec->json-schema nested-ref-spec)]
+      (is (= {:type "object" :properties {"street" {:type "string"}} :required ["street"]}
+             (get-in s [:properties "address"]))
+          "the nested ref must be the real object, not a dangling pointer")
+      (is (= {:type "string"} (get-in s [:properties "name"])))))
+
+  (testing "no $ref or definitions survives anywhere in the emitted schema"
+    (doseq [[label spec] [["flat" flat-ref-spec] ["nested" nested-ref-spec]]]
+      (let [rendered (pr-str (sio/malli-spec->json-schema spec))]
+        (is (not (clojure.string/includes? rendered ":$ref"))
+            (str label ": a $ref pointer cannot resolve once nested under a property"))
+        (is (not (clojure.string/includes? rendered ":definitions"))
+            (str label ": definitions must not be emitted inside a field schema")))))
+
+  (testing "inlining does not disturb a ref-free schema"
+    (is (= {:type "object"
+            :properties {"a" {:type "string"}}
+            :required ["a"]}
+           (sio/malli-spec->json-schema [:map [:a :string]])))))
+
+;; ===========================================================================
+;; A union of integer|number is redundant — JSON Schema's `number` already
+;; admits integers. Malli renders [:or :int :double] as that union, and wrapping
+;; it in :maybe nests a union INSIDE a union:
+;;
+;;   {"oneOf":[{"anyOf":[{"type":"integer"},{"type":"number"}]},{"type":"null"}]}
+;;
+;; That is noise in the contract the model reads, and models comply with it
+;; worse than with a plain type. Collapsing it changes nothing semantically.
+;; ===========================================================================
+
+(deftest redundant-numeric-unions-are-collapsed-test
+  (testing "integer|number collapses to number"
+    (is (= {:type "number"} (sio/malli-spec->json-schema [:or :int :double]))))
+
+  (testing "the collapse survives :maybe, leaving a single level of nesting"
+    (is (= {:oneOf [{:type "number"} {:type "null"}]}
+           (sio/malli-spec->json-schema [:maybe [:or :int :double]]))))
+
+  (testing "a description on the union is preserved"
+    (is (= {:type "number" :description "Score from 0.0 to 1.0"}
+           (sio/malli-spec->json-schema [:or {:description "Score from 0.0 to 1.0"} :int :double]))))
+
+  (testing "collapsed inside a map property"
+    (is (= {:type "number"}
+           (get-in (sio/malli-spec->json-schema [:map [:gpa [:or :int :double]]])
+                   [:properties "gpa"]))))
+
+  (testing "a union that is NOT all-numeric is left alone"
+    (let [s (sio/malli-spec->json-schema [:or :string :int])]
+      (is (nil? (:type s)) "a string|integer union must stay a union")
+      (is (= 2 (count (:anyOf s))))))
+
+  (testing "a plain integer stays an integer — collapsing must not widen a lone type"
+    (is (= {:type "integer"} (sio/malli-spec->json-schema :int)))
+    (is (= {:type "number"} (sio/malli-spec->json-schema :double)))))
