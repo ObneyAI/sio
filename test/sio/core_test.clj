@@ -463,7 +463,7 @@
            (sio/malli-spec->json-schema [:= false]))))
 
   (testing "Or converts every structured alternative"
-    (is (= {:oneOf
+    (is (= {:anyOf
             [{:type "object"
               :properties {"action" {:const "invoke"}
                            "capability" {:type "string"}}
@@ -477,8 +477,8 @@
              [:map [:action [:= :invoke]] [:capability :string]]
              [:map [:action [:= :respond]] [:message :string]]]))))
 
-  (testing "Maybe converts to nullable"
-    (is (= {:type "string" :nullable true}
+  (testing "Maybe converts to a JSON Schema null union"
+    (is (= {:oneOf [{:type "string"} {:type "null"}]}
            (sio/malli-spec->json-schema [:maybe :string]))))
 
   (testing "Map converts to object with properties"
@@ -520,21 +520,25 @@
       (is (= "object" (get-in schema [:properties "user" :type])))
       (is (= {:type "string"} (get-in schema [:properties "user" :properties "name"])))))
 
-  (testing "Wrapped specs unwrap correctly"
-    (is (= {:type "string"}
+  (testing "Schema constraints are preserved"
+    (is (= {:type "string" :minLength 1}
            (sio/malli-spec->json-schema [:string {:min 1}]))))
 
   (testing "Tuple converts to array with positional items"
-    (is (= {:type "array" :items [{:type "string"} {:type "integer"}]}
+    (is (= {:type "array"
+            :items [{:type "string"} {:type "integer"}]
+            :additionalItems false}
            (sio/malli-spec->json-schema [:tuple :string :int]))))
 
-  (testing "Bare keyword complex types convert"
-    (is (= {:type "object"} (sio/malli-spec->json-schema :map)))
-    (is (= {:type "object"} (sio/malli-spec->json-schema :map-of)))
-    (is (= {:type "array"} (sio/malli-spec->json-schema :vector)))
-    (is (= {:type "array"} (sio/malli-spec->json-schema :sequential)))
-    (is (= {:type "array" :uniqueItems true} (sio/malli-spec->json-schema :set)))
-    (is (= {:type "array"} (sio/malli-spec->json-schema :tuple))))
+  (testing "Bare schemas follow Malli's arity requirements"
+    (is (= {:type "object" :properties {}}
+           (sio/malli-spec->json-schema :map)))
+    (is (= {:type "array" :items [] :additionalItems false}
+           (sio/malli-spec->json-schema :tuple)))
+    (is (thrown? Exception (sio/malli-spec->json-schema :map-of)))
+    (is (thrown? Exception (sio/malli-spec->json-schema :vector)))
+    (is (thrown? Exception (sio/malli-spec->json-schema :sequential)))
+    (is (thrown? Exception (sio/malli-spec->json-schema :set))))
 
   (testing "Composite schemas tolerate a leading Malli properties map (spec-children)"
     ;; Without the spec-children fix, the props map is mistaken for the child
@@ -553,9 +557,10 @@
            (sio/malli-spec->json-schema [:map-of {:description "x"} :string :int])))
     (is (= {:type "string" :enum ["a" "b"] :description "x"}
            (sio/malli-spec->json-schema [:enum {:description "x"} "a" "b"])))
-    (is (= {:type "integer" :nullable true :description "x"}
+    (is (= {:oneOf [{:type "integer"} {:type "null"}] :description "x"}
            (sio/malli-spec->json-schema [:maybe {:description "x"} :int])))
-    (is (= {:type "array" :items [{:type "string"} {:type "integer"}] :description "x"}
+    (is (= {:type "array" :items [{:type "string"} {:type "integer"}]
+            :additionalItems false :description "x"}
            (sio/malli-spec->json-schema [:tuple {:description "x"} :string :int])))))
 
 (deftest outputs->tool-definition-test
@@ -617,11 +622,11 @@
           (get-in (sio/outputs->tool-definition spec)
                   [:function :parameters :properties "decision"])]
       (is (nil? (:type decision-schema)))
-      (is (= 2 (count (:oneOf decision-schema))))
-      (is (every? #(= "object" (:type %)) (:oneOf decision-schema)))
+      (is (= 2 (count (:anyOf decision-schema))))
+      (is (every? #(= "object" (:type %)) (:anyOf decision-schema)))
       (is (= {:const "invoke"}
              (get-in decision-schema
-                     [:oneOf 0 :properties "action"])))))
+                     [:anyOf 0 :properties "action"])))))
 
   (testing "Uses default description when instructions not provided"
     (let [spec {:outputs [{:name :x :spec :string}]}
@@ -809,9 +814,9 @@
            (:description (sio/malli-spec->json-schema
                           [:or {:description "Score from 0.0 to 1.0"} :int :double])))))
 
-  (testing "A :maybe carries its :description alongside :nullable"
+  (testing "A :maybe carries its :description alongside its null union"
     (let [s (sio/malli-spec->json-schema [:maybe {:description "ACT, or null."} :int])]
-      (is (= true (:nullable s)))
+      (is (= [{:type "integer"} {:type "null"}] (:oneOf s)))
       (is (= "ACT, or null." (:description s)))))
 
   (testing "NESTED descriptions survive — the actual regression"
@@ -828,6 +833,14 @@
              (get-in s [:properties "score" :description])))
       (is (= "3-5 specific factors."
              (get-in s [:properties "key-factors" :description])))))
+
+  (testing "Descriptions on map entries survive"
+    (is (= "Confidence from 0.0 to 1.0"
+           (get-in (sio/malli-spec->json-schema
+                    [:map
+                     [:score {:description "Confidence from 0.0 to 1.0"}
+                      :double]])
+                   [:properties "score" :description]))))
 
   (testing "Nested descriptions reach the function-calling tool definition"
     (let [tool (sio/outputs->tool-definition
@@ -847,9 +860,10 @@
       (is (= "from field"
              (get-in tool [:function :parameters :properties "answer" :description])))))
 
-  (testing "Properties WITHOUT a :description add no stray keys (regression guard)"
-    (is (= {:type "string"} (sio/malli-spec->json-schema [:string {:min 1}])))
-    (is (= {:type "array" :items {:type "string"}}
+  (testing "Other Malli properties are preserved without adding a description"
+    (is (= {:type "string" :minLength 1}
+           (sio/malli-spec->json-schema [:string {:min 1}])))
+    (is (= {:type "array" :items {:type "string"} :minItems 1}
            (sio/malli-spec->json-schema [:vector {:min 1} :string])))
     (is (= {:type "string" :enum ["a" "b"]}
            (sio/malli-spec->json-schema [:enum "a" "b"])))

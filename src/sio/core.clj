@@ -37,7 +37,8 @@
   and `parse-tool-call-response` reads the arguments back out."
   (:require [clojure.string :as str]
             [clojure.data.json :as json]
-            [malli.core :as m]))
+            [malli.core :as m]
+            [malli.json-schema :as mjs]))
 
 ;; =============================================================================
 ;; Malli Schema Support
@@ -207,129 +208,37 @@
 ;; JSON Schema Conversion (for function calling)
 ;; =============================================================================
 
-(defn- spec-children
-  "Child schemas of a composite Malli spec, skipping a leading properties/options map.
-   Malli allows properties as the second element of any schema, e.g.
-   [:vector {:description \"...\"} item]. Without this, callers that take `(second spec)`
-   as the child would grab the options map instead of the real child schema (producing,
-   for a vector, `items {:type \"string\"}` — i.e. 'array of strings' — for ANY item type)."
-  [spec]
-  (let [args (rest spec)]
-    (if (map? (first args)) (rest args) args)))
+(defn- keyword->json-string [value]
+  (if-let [keyword-ns (namespace value)]
+    (str keyword-ns "/" (name value))
+    (name value)))
 
-(defn- enum-value->json
-  "Render Malli enum and literal members using their canonical JSON representation."
-  [value]
-  (if (keyword? value)
-    (if-let [keyword-ns (namespace value)]
-      (str keyword-ns "/" (name value))
-      (name value))
-    value))
-
-(declare malli-spec->json-schema)
-
-(defn- spec-description
-  "The :description a Malli schema carries in its own properties map, e.g.
-   [:string {:description \"...\"}] or [:vector {:description \"...\"} :string].
-   Malli allows properties as the second element of any schema."
-  [spec]
-  (when (and (vector? spec) (map? (second spec)))
-    (:description (second spec))))
-
-(defn- malli-spec->json-schema* [spec]
+(defn- json-compatible-schema [value]
   (cond
-    ;; Primitives
-    (= spec :string) {:type "string"}
-    (= spec :int) {:type "integer"}
-    (= spec :double) {:type "number"}
-    (= spec :float) {:type "number"}
-    (= spec :boolean) {:type "boolean"}
-    (= spec :any) {}
-    ;; Bare keyword complex types
-    (= spec :map) {:type "object"}
-    (= spec :map-of) {:type "object"}
-    (= spec :vector) {:type "array"}
-    (= spec :sequential) {:type "array"}
-    (= spec :set) {:type "array" :uniqueItems true}
-    (= spec :tuple) {:type "array"}
-    (= spec 'string?) {:type "string"}
-    (= spec 'int?) {:type "integer"}
-    (= spec 'double?) {:type "number"}
-    (= spec 'float?) {:type "number"}
-    (= spec 'boolean?) {:type "boolean"}
-
-    ;; Enum - list allowed values
-    (and (vector? spec) (= :enum (first spec)))
-    {:type "string" :enum (mapv enum-value->json (spec-children spec))}
-
-    ;; Literal - require the exact JSON representation
-    (and (vector? spec) (= := (first spec)))
-    {:const (enum-value->json (first (spec-children spec)))}
-
-    ;; Union - preserve every alternative as a structured JSON Schema
-    (and (vector? spec) (= :or (first spec)))
-    {:oneOf (mapv malli-spec->json-schema (spec-children spec))}
-
-    ;; Maybe - nullable
-    (and (vector? spec) (= :maybe (first spec)))
-    (let [inner (malli-spec->json-schema (first (spec-children spec)))]
-      (if (:type inner)
-        (assoc inner :nullable true)
-        inner))
-
-    ;; Map with explicit fields
-    (and (vector? spec) (= :map (first spec)))
-    (let [fields (filter vector? (rest spec))
-          required-fields (for [[k & rest] fields
-                                :let [opts (when (map? (first rest)) (first rest))
-                                      optional? (:optional opts)]
-                                :when (not optional?)]
-                            (name k))
-          properties (into {}
-                           (for [[k & rest] fields
-                                 :let [opts (when (map? (first rest)) (first rest))
-                                       field-spec (if opts (second rest) (first rest))]]
-                             [(name k) (malli-spec->json-schema field-spec)]))]
-      (cond-> {:type "object" :properties properties}
-        (seq required-fields) (assoc :required (vec required-fields))))
-
-    ;; Map-of - object with additionalProperties
-    (and (vector? spec) (= :map-of (first spec)))
-    {:type "object" :additionalProperties (malli-spec->json-schema (second (spec-children spec)))}
-
-    ;; Vector/sequential - array
-    (and (vector? spec) (#{:vector :sequential} (first spec)))
-    {:type "array" :items (malli-spec->json-schema (first (spec-children spec)))}
-
-    ;; Set - array with unique items
-    (and (vector? spec) (= :set (first spec)))
-    {:type "array" :items (malli-spec->json-schema (first (spec-children spec))) :uniqueItems true}
-
-    ;; Tuple - array with positional items
-    (and (vector? spec) (= :tuple (first spec)))
-    {:type "array" :items (mapv malli-spec->json-schema (spec-children spec))}
-
-    ;; Wrapped specs like [:string {:min 1}] - recurse on first element
-    (vector? spec)
-    (malli-spec->json-schema (first spec))
-
-    :else {:type "string"}))
+    (keyword? value) (keyword->json-string value)
+    (map? value) (into (empty value)
+                       (map (fn [[k v]]
+                              [k (if (#{:properties :definitions} k)
+                                   (into {}
+                                         (map (fn [[schema-k schema-v]]
+                                                [(if (keyword? schema-k)
+                                                   (keyword->json-string schema-k)
+                                                   schema-k)
+                                                 (json-compatible-schema schema-v)]))
+                                         v)
+                                   (json-compatible-schema v))]))
+                       value)
+    (vector? value) (mapv json-compatible-schema value)
+    (seq? value) (mapv json-compatible-schema value)
+    :else value))
 
 (defn malli-spec->json-schema
   "Convert a Malli spec to JSON Schema format for function calling parameters.
 
-  Supports common Malli types: :string, :int, :double, :boolean, :enum, :map, :vector, etc.
-  Collection/composite schemas tolerate a leading properties map (see `spec-children`).
-
-  A schema's own `{:description \"...\"}` property is carried onto the emitted
-  JSON Schema — including for schemas nested inside a :map's properties, which is
-  where a function-calling model reads per-field guidance. This matches what
-  malli.json-schema/transform emits."
+  Delegates conversion to Malli's JSON Schema transformer, then normalizes
+  Clojure keywords to their canonical JSON string representation."
   [spec]
-  (let [schema (malli-spec->json-schema* spec)]
-    (if-let [description (spec-description spec)]
-      (assoc schema :description description)
-      schema)))
+  (json-compatible-schema (mjs/transform spec)))
 
 (defn outputs->tool-definition
   "Convert a spec's outputs to a function-calling tool definition.
