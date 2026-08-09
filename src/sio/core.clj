@@ -274,14 +274,57 @@
       (resolve* (dissoc schema :definitions) #{}))
     schema))
 
+(def ^:private numeric-json-types #{"integer" "number"})
+
+(defn- redundant-numeric-union?
+  "Is this a union whose branches are all bare numeric types? JSON Schema's
+   `number` already admits integers, so integer|number is exactly `number`."
+  [branches]
+  (and (seq branches)
+       (every? (fn [b] (and (map? b)
+                            (= #{:type} (set (keys b)))
+                            (contains? numeric-json-types (:type b))))
+               branches)))
+
+(defn- collapse-numeric-unions
+  "Collapse a redundant numeric union into a single `{:type \"number\"}`.
+
+  Malli renders a Clojure-side `[:or :int :double]` — which exists so validation
+  accepts both a Long and a Double — as `{:anyOf [{:type \"integer\"} {:type
+  \"number\"}]}`. In JSON Schema that union is a no-op, and wrapping it in
+  `:maybe` nests a union inside a union:
+
+      {:oneOf [{:anyOf [{:type \"integer\"} {:type \"number\"}]} {:type \"null\"}]}
+
+  That is noise in the contract the model reads, and models comply with a plain
+  type more reliably than with nested unions. Collapsing changes nothing
+  semantically. A union that is not entirely numeric is left alone, and a lone
+  `{:type \"integer\"}` is never widened."
+  [schema]
+  (letfn [(collapse [x]
+            (cond
+              (map? x)
+              (let [x (into (empty x) (map (fn [[k v]] [k (collapse v)])) x)]
+                (if-let [branches (some #(when (redundant-numeric-union? (get x %)) (get x %))
+                                        [:anyOf :oneOf])]
+                  (-> x (dissoc :anyOf :oneOf) (assoc :type "number"))
+                  x))
+              (vector? x) (mapv collapse x)
+              (seq? x) (mapv collapse x)
+              :else x))]
+    (collapse schema)))
+
 (defn malli-spec->json-schema
   "Convert a Malli spec to JSON Schema format for function calling parameters.
 
   Delegates conversion to Malli's JSON Schema transformer, inlines any registry
-  references so the result is self-contained (see `inline-definitions`), then
-  normalizes Clojure keywords to their canonical JSON string representation."
+  references so the result is self-contained (see `inline-definitions`), collapses
+  redundant numeric unions (see `collapse-numeric-unions`), then normalizes Clojure
+  keywords to their canonical JSON string representation."
   [spec]
-  (json-compatible-schema (inline-definitions (mjs/transform spec))))
+  (json-compatible-schema
+   (collapse-numeric-unions
+    (inline-definitions (mjs/transform spec)))))
 
 (defn outputs->tool-definition
   "Convert a spec's outputs to a function-calling tool definition.

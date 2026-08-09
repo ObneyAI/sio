@@ -919,3 +919,40 @@
             :properties {"a" {:type "string"}}
             :required ["a"]}
            (sio/malli-spec->json-schema [:map [:a :string]])))))
+
+;; ===========================================================================
+;; A union of integer|number is redundant — JSON Schema's `number` already
+;; admits integers. Malli renders [:or :int :double] as that union, and wrapping
+;; it in :maybe nests a union INSIDE a union:
+;;
+;;   {"oneOf":[{"anyOf":[{"type":"integer"},{"type":"number"}]},{"type":"null"}]}
+;;
+;; That is noise in the contract the model reads, and models comply with it
+;; worse than with a plain type. Collapsing it changes nothing semantically.
+;; ===========================================================================
+
+(deftest redundant-numeric-unions-are-collapsed-test
+  (testing "integer|number collapses to number"
+    (is (= {:type "number"} (sio/malli-spec->json-schema [:or :int :double]))))
+
+  (testing "the collapse survives :maybe, leaving a single level of nesting"
+    (is (= {:oneOf [{:type "number"} {:type "null"}]}
+           (sio/malli-spec->json-schema [:maybe [:or :int :double]]))))
+
+  (testing "a description on the union is preserved"
+    (is (= {:type "number" :description "Score from 0.0 to 1.0"}
+           (sio/malli-spec->json-schema [:or {:description "Score from 0.0 to 1.0"} :int :double]))))
+
+  (testing "collapsed inside a map property"
+    (is (= {:type "number"}
+           (get-in (sio/malli-spec->json-schema [:map [:gpa [:or :int :double]]])
+                   [:properties "gpa"]))))
+
+  (testing "a union that is NOT all-numeric is left alone"
+    (let [s (sio/malli-spec->json-schema [:or :string :int])]
+      (is (nil? (:type s)) "a string|integer union must stay a union")
+      (is (= 2 (count (:anyOf s))))))
+
+  (testing "a plain integer stays an integer — collapsing must not widen a lone type"
+    (is (= {:type "integer"} (sio/malli-spec->json-schema :int)))
+    (is (= {:type "number"} (sio/malli-spec->json-schema :double)))))
