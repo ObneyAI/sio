@@ -868,3 +868,54 @@
     (is (= {:type "string" :enum ["a" "b"]}
            (sio/malli-spec->json-schema [:enum "a" "b"])))
     (is (= {:const false} (sio/malli-spec->json-schema [:= false])))))
+
+;; ===========================================================================
+;; Registry refs must be INLINED, not emitted as $ref/definitions.
+;;
+;; Malli's transformer emits {"$ref" "#/definitions/foo" "definitions" {...}}
+;; for a registry reference. That pointer addresses the DOCUMENT ROOT, but a
+;; field's schema is nested at parameters.properties.<field>, so the definitions
+;; map lands nested too and the pointer cannot resolve. Consumers pass the tool
+;; schema through untouched (litellm's transform-tools moves :parameters by
+;; identity), so an unresolvable pointer reaches the provider verbatim — and
+;; Gemini's function-declaration subset does not reliably support $ref at all.
+;;
+;; Inlining also has to be RECURSIVE: resolving only the top level leaves nested
+;; refs behind, which looks correct on the first field you inspect.
+;; ===========================================================================
+
+(def ^:private flat-ref-spec
+  [:schema {:registry {:t/addr [:map [:street :string]]}} :t/addr])
+
+(def ^:private nested-ref-spec
+  [:schema {:registry {:t/addr [:map [:street :string]]
+                       :t/person [:map [:name :string] [:address :t/addr]]}}
+   :t/person])
+
+(deftest registry-refs-are-inlined-test
+  (testing "a top-level registry ref is replaced by its target"
+    (is (= {:type "object"
+            :properties {"street" {:type "string"}}
+            :required ["street"]}
+           (sio/malli-spec->json-schema flat-ref-spec))))
+
+  (testing "a NESTED registry ref is inlined too (one level of deref is not enough)"
+    (let [s (sio/malli-spec->json-schema nested-ref-spec)]
+      (is (= {:type "object" :properties {"street" {:type "string"}} :required ["street"]}
+             (get-in s [:properties "address"]))
+          "the nested ref must be the real object, not a dangling pointer")
+      (is (= {:type "string"} (get-in s [:properties "name"])))))
+
+  (testing "no $ref or definitions survives anywhere in the emitted schema"
+    (doseq [[label spec] [["flat" flat-ref-spec] ["nested" nested-ref-spec]]]
+      (let [rendered (pr-str (sio/malli-spec->json-schema spec))]
+        (is (not (clojure.string/includes? rendered ":$ref"))
+            (str label ": a $ref pointer cannot resolve once nested under a property"))
+        (is (not (clojure.string/includes? rendered ":definitions"))
+            (str label ": definitions must not be emitted inside a field schema")))))
+
+  (testing "inlining does not disturb a ref-free schema"
+    (is (= {:type "object"
+            :properties {"a" {:type "string"}}
+            :required ["a"]}
+           (sio/malli-spec->json-schema [:map [:a :string]])))))

@@ -232,13 +232,56 @@
     (seq? value) (mapv json-compatible-schema value)
     :else value))
 
+(defn- json-pointer->definition-key
+  "Decode a `#/definitions/...` JSON Pointer into its definitions-map key.
+   Per RFC 6901 `~1` decodes to `/` and `~0` to `~`, and `~1` must be decoded
+   first — a namespaced Malli ref like :t/addr arrives as `t~1addr`."
+  [pointer]
+  (-> pointer
+      (str/replace #"^#/definitions/" "")
+      (str/replace "~1" "/")
+      (str/replace "~0" "~")))
+
+(defn- inline-definitions
+  "Splice `:definitions` into the schema so it is self-contained.
+
+  Malli renders a registry reference as
+  `{:$ref \"#/definitions/x\" :definitions {\"x\" {...}}}`. The pointer addresses
+  the JSON Schema DOCUMENT ROOT, but a field's schema is nested at
+  `parameters.properties.<field>`, so the definitions map lands nested too and the
+  pointer can never resolve. Consumers pass the tool schema through untouched, so
+  an unresolvable pointer reaches the provider verbatim — and provider function-call
+  schema subsets (Gemini's, notably) do not reliably support `$ref` at all.
+
+  Resolution is RECURSIVE, because a definition may reference another; inlining only
+  the top level leaves nested refs dangling. A self-referential schema degrades to a
+  bare object rather than recursing forever, and an unknown pointer is left untouched
+  rather than silently becoming nil."
+  [schema]
+  (if-let [definitions (:definitions schema)]
+    (letfn [(resolve* [x seen]
+              (cond
+                (and (map? x) (:$ref x))
+                (let [k (json-pointer->definition-key (:$ref x))]
+                  (cond
+                    (contains? seen k) {:type "object"}
+                    (contains? definitions k) (resolve* (get definitions k) (conj seen k))
+                    :else x))
+                (map? x) (into (empty x) (map (fn [[k v]] [k (resolve* v seen)])) x)
+                (vector? x) (mapv #(resolve* % seen) x)
+                (seq? x) (mapv #(resolve* % seen) x)
+                :else x))]
+      (resolve* (dissoc schema :definitions) #{}))
+    schema))
+
 (defn malli-spec->json-schema
   "Convert a Malli spec to JSON Schema format for function calling parameters.
 
-  Delegates conversion to Malli's JSON Schema transformer, then normalizes
-  Clojure keywords to their canonical JSON string representation."
+  Delegates conversion to Malli's JSON Schema transformer, inlines any registry
+  references so the result is self-contained (see `inline-definitions`), then
+  normalizes Clojure keywords to their canonical JSON string representation."
   [spec]
-  (json-compatible-schema (mjs/transform spec)))
+  (json-compatible-schema (inline-definitions (mjs/transform spec))))
 
 (defn outputs->tool-definition
   "Convert a spec's outputs to a function-calling tool definition.
