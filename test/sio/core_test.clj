@@ -539,19 +539,23 @@
   (testing "Composite schemas tolerate a leading Malli properties map (spec-children)"
     ;; Without the spec-children fix, the props map is mistaken for the child
     ;; schema and the element type collapses to string / leaks into the output.
-    (is (= {:type "array" :items {:type "integer"}}
+    ;; The point of these cases is the CHILD TYPE (items/additionalProperties)
+    ;; surviving the leading props map. The props map's :description is now also
+    ;; carried onto the emitted schema — see
+    ;; malli-description-properties-reach-the-json-schema-test.
+    (is (= {:type "array" :items {:type "integer"} :description "x"}
            (sio/malli-spec->json-schema [:vector {:description "x"} :int])))
-    (is (= {:type "array" :items {:type "integer"}}
+    (is (= {:type "array" :items {:type "integer"} :description "x"}
            (sio/malli-spec->json-schema [:sequential {:description "x"} :int])))
-    (is (= {:type "array" :items {:type "integer"} :uniqueItems true}
+    (is (= {:type "array" :items {:type "integer"} :uniqueItems true :description "x"}
            (sio/malli-spec->json-schema [:set {:description "x"} :int])))
-    (is (= {:type "object" :additionalProperties {:type "integer"}}
+    (is (= {:type "object" :additionalProperties {:type "integer"} :description "x"}
            (sio/malli-spec->json-schema [:map-of {:description "x"} :string :int])))
-    (is (= {:type "string" :enum ["a" "b"]}
+    (is (= {:type "string" :enum ["a" "b"] :description "x"}
            (sio/malli-spec->json-schema [:enum {:description "x"} "a" "b"])))
-    (is (= {:type "integer" :nullable true}
+    (is (= {:type "integer" :nullable true :description "x"}
            (sio/malli-spec->json-schema [:maybe {:description "x"} :int])))
-    (is (= {:type "array" :items [{:type "string"} {:type "integer"}]}
+    (is (= {:type "array" :items [{:type "string"} {:type "integer"}] :description "x"}
            (sio/malli-spec->json-schema [:tuple {:description "x"} :string :int])))))
 
 (deftest outputs->tool-definition-test
@@ -775,3 +779,78 @@
       (is (= [] (sio/parse-streaming-json-array
                  "[#=(spit \"/tmp/sio-rce-should-not-exist\" \"x\")]")))
       (is (not (.exists marker)) "reader macro must not have executed"))))
+
+;; ===========================================================================
+;; Malli :description properties must survive into the provider-facing schema.
+;;
+;; The hand-rolled converter previously ignored a schema's properties map, so
+;; [:string {:description "..."}] fell through the "wrapped spec — recurse on
+;; the first element" branch and emitted a bare {:type "string"}. Any guidance
+;; authored below the top level of a function-calling output silently vanished
+;; from what the model was shown, with no error. malli's own json-schema
+;; transformer emits these, so this was also a divergence from Malli semantics.
+;; ===========================================================================
+
+(deftest malli-description-properties-reach-the-json-schema-test
+  (testing "A primitive carries its :description"
+    (is (= {:type "string" :description "The student's verbatim quote."}
+           (sio/malli-spec->json-schema
+            [:string {:description "The student's verbatim quote."}]))))
+
+  (testing "A collection carries its :description (and keeps its item type)"
+    (is (= {:type "array" :items {:type "string"}
+            :description "3-5 specific factors that influenced this score."}
+           (sio/malli-spec->json-schema
+            [:vector {:description "3-5 specific factors that influenced this score."}
+             :string]))))
+
+  (testing "A union carries its :description"
+    (is (= "Score from 0.0 to 1.0"
+           (:description (sio/malli-spec->json-schema
+                          [:or {:description "Score from 0.0 to 1.0"} :int :double])))))
+
+  (testing "A :maybe carries its :description alongside :nullable"
+    (let [s (sio/malli-spec->json-schema [:maybe {:description "ACT, or null."} :int])]
+      (is (= true (:nullable s)))
+      (is (= "ACT, or null." (:description s)))))
+
+  (testing "NESTED descriptions survive — the actual regression"
+    (let [s (sio/malli-spec->json-schema
+             [:map {:description "Multi-dimension scoring for ONE program."}
+              [:reasoning [:string {:description "2-3 sentences, produced BEFORE the score."}]]
+              [:score [:or {:description "Financial fit 0.0-1.0; use net tuition, NOT raw tuition."}
+                       :int :double]]
+              [:key-factors [:vector {:description "3-5 specific factors."} :string]]])]
+      (is (= "Multi-dimension scoring for ONE program." (:description s)))
+      (is (= "2-3 sentences, produced BEFORE the score."
+             (get-in s [:properties "reasoning" :description])))
+      (is (= "Financial fit 0.0-1.0; use net tuition, NOT raw tuition."
+             (get-in s [:properties "score" :description])))
+      (is (= "3-5 specific factors."
+             (get-in s [:properties "key-factors" :description])))))
+
+  (testing "Nested descriptions reach the function-calling tool definition"
+    (let [tool (sio/outputs->tool-definition
+                {:instructions "Score this program."
+                 :outputs [{:name :financial
+                            :spec [:map [:score [:or {:description "Use net tuition, NOT raw tuition."}
+                                                 :int :double]]]}]})
+          score (get-in tool [:function :parameters :properties "financial"
+                              :properties "score"])]
+      (is (= "Use net tuition, NOT raw tuition." (:description score)))))
+
+  (testing "An explicit field :description still wins over the schema's own"
+    (let [tool (sio/outputs->tool-definition
+                {:outputs [{:name :answer
+                            :spec [:string {:description "from schema"}]
+                            :description "from field"}]})]
+      (is (= "from field"
+             (get-in tool [:function :parameters :properties "answer" :description])))))
+
+  (testing "Properties WITHOUT a :description add no stray keys (regression guard)"
+    (is (= {:type "string"} (sio/malli-spec->json-schema [:string {:min 1}])))
+    (is (= {:type "array" :items {:type "string"}}
+           (sio/malli-spec->json-schema [:vector {:min 1} :string])))
+    (is (= {:type "string" :enum ["a" "b"]}
+           (sio/malli-spec->json-schema [:enum "a" "b"])))
+    (is (= {:const false} (sio/malli-spec->json-schema [:= false])))))

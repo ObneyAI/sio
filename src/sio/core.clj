@@ -226,12 +226,17 @@
       (name value))
     value))
 
-(defn malli-spec->json-schema
-  "Convert a Malli spec to JSON Schema format for function calling parameters.
+(declare malli-spec->json-schema)
 
-  Supports common Malli types: :string, :int, :double, :boolean, :enum, :map, :vector, etc.
-  Collection/composite schemas tolerate a leading properties map (see `spec-children`)."
+(defn- spec-description
+  "The :description a Malli schema carries in its own properties map, e.g.
+   [:string {:description \"...\"}] or [:vector {:description \"...\"} :string].
+   Malli allows properties as the second element of any schema."
   [spec]
+  (when (and (vector? spec) (map? (second spec)))
+    (:description (second spec))))
+
+(defn- malli-spec->json-schema* [spec]
   (cond
     ;; Primitives
     (= spec :string) {:type "string"}
@@ -309,6 +314,22 @@
     (malli-spec->json-schema (first spec))
 
     :else {:type "string"}))
+
+(defn malli-spec->json-schema
+  "Convert a Malli spec to JSON Schema format for function calling parameters.
+
+  Supports common Malli types: :string, :int, :double, :boolean, :enum, :map, :vector, etc.
+  Collection/composite schemas tolerate a leading properties map (see `spec-children`).
+
+  A schema's own `{:description \"...\"}` property is carried onto the emitted
+  JSON Schema — including for schemas nested inside a :map's properties, which is
+  where a function-calling model reads per-field guidance. This matches what
+  malli.json-schema/transform emits."
+  [spec]
+  (let [schema (malli-spec->json-schema* spec)]
+    (if-let [description (spec-description spec)]
+      (assoc schema :description description)
+      schema)))
 
 (defn outputs->tool-definition
   "Convert a spec's outputs to a function-calling tool definition.
