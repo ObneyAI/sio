@@ -1,5 +1,6 @@
 (ns sio.core-test
   (:require [clojure.test :refer [deftest is testing]]
+            [clojure.string :as str]
             [sio.core :as sio]))
 
 ;; =============================================================================
@@ -982,3 +983,43 @@
   (testing "a plain integer stays an integer — collapsing must not widen a lone type"
     (is (= {:type "integer"} (sio/malli-spec->json-schema :int)))
     (is (= {:type "number"} (sio/malli-spec->json-schema :double)))))
+
+;; =============================================================================
+;; Type rendering — DSCloj parity + union descriptions
+;; =============================================================================
+
+(deftest dscloj-prompt-parity-golden-test
+  (testing "the marker prompt is a 1:1 port of DSCloj's module->prompt — verified
+            byte-identical against DSCloj 0c76d42 for this module; this golden pins it"
+    ;; If this fails after an intentional renderer change, update the golden AND
+    ;; re-run the DSCloj side-by-side so the divergence is a decision, not drift.
+    (let [module {:instructions "Extract financial context from the transcript."
+                  :inputs  [{:name :transcript-corrected :spec :string
+                             :description "The corrected transcript."}]
+                  :outputs [{:name :reasoning :spec :string :description "Brief analysis first."}
+                            {:name :efc-mentioned :spec [:maybe :string]
+                             :description "EFC if mentioned; '' if not."}
+                            {:name :financial-concerns :spec [:maybe [:vector :string]]
+                             :description "Concerns; [] if none."}
+                            {:name :knows-tops :spec [:maybe :boolean] :description "Tri-state."}]}
+          prompt (sio/spec->prompt module)]
+      (is (str/includes? prompt "`efc-mentioned` (str or null): EFC if mentioned; '' if not."))
+      (is (str/includes? prompt "`financial-concerns` (json array of str or null): Concerns; [] if none."))
+      (is (str/includes? prompt "`knows-tops` (bool or null): Tri-state.")))))
+
+(deftest union-types-render-their-branches-test
+  (testing "[:or ...] renders each branch instead of collapsing to \"str\" — a deliberate
+            improvement over the inherited DSCloj behavior (its spec->type-str had no
+            :or case and fell through to \"str\", mis-describing every union field)"
+    (let [render (fn [spec]
+                   (let [p (sio/spec->prompt {:inputs [] :instructions "x"
+                                              :outputs [{:name :f :spec spec}]})]
+                     (second (re-find #"`f` \(([^)]*)\)" p))))]
+      (is (= "int or float" (render [:or :int :double]))
+          "the rec pipeline's score fields — previously described to the model as str")
+      (is (= "bool or str" (render [:or :boolean :string])))
+      (is (= "json array of str or str" (render [:or [:vector :string] :string])))
+      (is (= "int or float, or null" (render [:maybe [:or :int :double]]))
+          ":maybe wraps the WHOLE union — comma disambiguates the null from the branches")
+      (is (= "str" (render :string))
+          "non-union rendering unchanged — parity with DSCloj holds everywhere else"))))

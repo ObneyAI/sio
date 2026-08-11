@@ -103,9 +103,24 @@
     (and (vector? spec) (= :enum (first spec)))
     (str "one of: " (str/join ", " (map str (rest spec))))
 
-    ;; Maybe - nullable
+    ;; Maybe - nullable. A union child gets a comma before the null so the null
+    ;; reads as an alternative to the WHOLE union, not to its last branch.
     (and (vector? spec) (= :maybe (first spec)))
-    (str (spec->type-str (second spec)) " or null")
+    (let [child (second spec)
+          child-str (spec->type-str child)]
+      (if (and (vector? child) (= :or (first child)))
+        (str child-str ", or null")
+        (str child-str " or null")))
+
+    ;; Union — render every branch. Inherited DSCloj behavior had no :or case and
+    ;; fell through to "str", telling the model every union field was a string —
+    ;; which actively prompted the singleton-string / quoted-scalar failures the
+    ;; parse side then had to repair. Properties (e.g. a :description carried on
+    ;; the union) are skipped in the type string, as elsewhere.
+    (and (vector? spec) (= :or (first spec)))
+    (let [branches (cond-> (rest spec)
+                     (map? (second spec)) rest)]
+      (str/join " or " (map spec->type-str branches)))
 
     ;; Wrapped specs like [:string {:min 1}] - recurse on first element
     (vector? spec) (spec->type-str (first spec))
