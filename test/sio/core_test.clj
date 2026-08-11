@@ -354,6 +354,24 @@
           result (sio/parse-output response spec)]
       (is (= ["a" "b" "c"] (:items result)))))
 
+  (testing "A scalar singleton preserves a declared vector output type on the TOOL-CALL path too"
+    ;; The singleton wrap initially lived only in parse-output (the marker/streaming
+    ;; path); parse-tool-call-response decoded the arguments raw, so a provider that
+    ;; returns a bare string for a declared vector leaked it through the FC path
+    ;; unwrapped. Both parse paths must enforce the declared cardinality.
+    (doseq [field-spec [[:vector :string]
+                        [:maybe [:vector :string]]
+                        [:maybe [:vector {:description "d"} :string]]]]
+      (let [outputs [{:name :mentions :spec field-spec}]
+            response {:choices [{:message {:tool-calls [{:function {:arguments "{\"mentions\": \"Cameron approved.\"}"}}]}}]}
+            result (sio/parse-tool-call-response response outputs)]
+        (is (= ["Cameron approved."] (:mentions result))
+            "a scalar for a declared vector wraps on the tool-call path")))
+    (let [outputs [{:name :mentions :spec [:vector :string]}]
+          response {:choices [{:message {:tool-calls [{:function {:arguments "{\"mentions\": [\"a\",\"b\"]}"}}]}}]}]
+      (is (= ["a" "b"] (:mentions (sio/parse-tool-call-response response outputs)))
+          "a real array is untouched — never double-wrapped")))
+
   (testing "A scalar singleton preserves a declared vector output type"
     (doseq [field-spec [[:vector :string]
                         [:maybe [:vector :string]]]]
