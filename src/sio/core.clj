@@ -377,12 +377,21 @@
             parsed (try
                      (json/read-str arguments-str :key-fn keyword)
                      (catch Exception _e nil))]
-        ;; Convert string keys to keyword keys matching output names
+        ;; Convert string keys to keyword keys matching output names.
+        ;; Cardinality is preserved on THIS path too: a provider that returns a bare
+        ;; scalar for a declared vector output gets the same singleton wrap as the
+        ;; marker/streaming parse (parse-output) — otherwise the FC path leaks the
+        ;; scalar through unwrapped and only one of the two parse paths is safe.
         (when parsed
           (into {}
-                (for [{:keys [name]} outputs
+                (for [{:keys [name spec]} outputs
                       :let [k (keyword (clojure.core/name name))
-                            v (get parsed k (get parsed (clojure.core/name name)))]]
+                            v (get parsed k (get parsed (clojure.core/name name)))
+                            v (if (and (vector-output-spec? spec)
+                                       (some? v)
+                                       (not (vector? v)))
+                                [v]
+                                v)]]
                   [name v])))))))
 
 ;; =============================================================================
