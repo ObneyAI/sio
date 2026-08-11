@@ -354,6 +354,14 @@
           result (sio/parse-output response spec)]
       (is (= ["a" "b" "c"] (:items result)))))
 
+  (testing "A scalar singleton preserves a declared vector output type"
+    (doseq [field-spec [[:vector :string]
+                        [:maybe [:vector :string]]]]
+      (let [spec {:outputs [{:name :mentions :spec field-spec}]}
+            response "[[ ## mentions ## ]]\nCameron approved the proposal."
+            result (sio/parse-output response spec)]
+        (is (= ["Cameron approved the proposal."] (:mentions result))))))
+
   (testing "Parse nested JSON output"
     (let [spec {:outputs [{:name :user
                            :spec [:map [:profile [:map [:name :string]]]]}]}

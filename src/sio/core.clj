@@ -204,6 +204,18 @@
         ;; Not JSON, return as-is
         value))))
 
+(defn- vector-output-spec?
+  "True when a schema requires a vector, allowing for Malli properties and a
+  nullable (`:maybe`) wrapper."
+  [spec]
+  (when (vector? spec)
+    (let [schema-type (first spec)
+          children (cond-> (rest spec)
+                     (map? (second spec)) rest)]
+      (or (= :vector schema-type)
+          (and (= :maybe schema-type)
+               (vector-output-spec? (first children)))))))
+
 ;; =============================================================================
 ;; JSON Schema Conversion (for function calling)
 ;; =============================================================================
@@ -518,7 +530,15 @@
 
                             ;; Complex specs - parse as JSON
                             (complex-spec? spec)
-                            (parse-json-value value)
+                            (let [parsed-value (parse-json-value value)]
+                              ;; Models commonly omit JSON array brackets for a
+                              ;; singleton. Preserve the schema's cardinality
+                              ;; instead of leaking a scalar through parse-output.
+                              (if (and (vector-output-spec? spec)
+                                       (some? parsed-value)
+                                       (not (vector? parsed-value)))
+                                [parsed-value]
+                                parsed-value))
 
                             ;; Booleans
                             (#{:boolean 'boolean?} base)
