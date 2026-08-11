@@ -289,10 +289,17 @@
     (letfn [(resolve* [x seen]
               (cond
                 (and (map? x) (:$ref x))
-                (let [k (json-pointer->definition-key (:$ref x))]
+                ;; Malli emits a referring schema's annotations BESIDE the pointer
+                ;; ({:$ref "#/definitions/x" :description "..."}). The siblings are the
+                ;; MORE specific guidance — authored at the point of use — so they are
+                ;; merged over the resolved definition rather than dropped with the
+                ;; pointer (issue #2: replacing the whole map silently lost them).
+                (let [k (json-pointer->definition-key (:$ref x))
+                      siblings (resolve* (dissoc x :$ref) seen)]
                   (cond
-                    (contains? seen k) {:type "object"}
-                    (contains? definitions k) (resolve* (get definitions k) (conj seen k))
+                    (contains? seen k) (merge {:type "object"} siblings)
+                    (contains? definitions k) (merge (resolve* (get definitions k) (conj seen k))
+                                                    siblings)
                     :else x))
                 (map? x) (into (empty x) (map (fn [[k v]] [k (resolve* v seen)])) x)
                 (vector? x) (mapv #(resolve* % seen) x)

@@ -920,6 +920,21 @@
    :t/person])
 
 (deftest registry-refs-are-inlined-test
+  (testing "a $ref's SIBLING keys survive inlining, and win over the definition (issue #2)"
+    ;; Malli renders `[:schema {:description "..."} ::number]` as
+    ;; {:$ref "#/definitions/..." :description "..."} — the annotation rides BESIDE the
+    ;; pointer. Replacing the whole map with the resolved definition silently dropped
+    ;; the authored guidance: the exact failure mode this branch set out to fix,
+    ;; reintroduced one layer down.
+    (let [spec [:schema {:registry {:t/num [:or :int :double]}}
+                [:map [:weight [:schema {:description "Strength of preference, 0.0-1.0."}
+                                :t/num]]]]
+          weight (get-in (sio/malli-spec->json-schema spec) [:properties "weight"])]
+      (is (= "Strength of preference, 0.0-1.0." (:description weight))
+          "the sibling :description must survive the $ref resolution")
+      (is (= "number" (:type weight))
+          "…without losing the resolved definition itself")))
+
   (testing "a top-level registry ref is replaced by its target"
     (is (= {:type "object"
             :properties {"street" {:type "string"}}
