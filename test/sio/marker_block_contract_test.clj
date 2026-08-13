@@ -82,6 +82,29 @@
              "[[ ## a ## ]]\nsee `[[ ## b ## ]]` for the format\n[[ ## b ## ]]\nreal\n"
              two-strings)))))
 
+(deftest an-unquoted-output-marker-after-prose-starts-a-block-test
+  ;; PROVENANCE: ORC DET-E2E-115, GitHub Actions run 31726599009. Gemini
+  ;; completed its related-reasoning prose, then appended the real declared
+  ;; related-pairs marker on the same line. Requiring a newline discarded the
+  ;; structured answer and atomically failed the ontology build.
+  (testing "a real output marker appended after prose is extracted"
+    (is (= {:reasoning "analysis complete."
+            :related-pairs [{:concept1 "Priority Channel"
+                             :concept2 "Normal Channel"
+                             :reason "complementary tiers"}]}
+           (sio/parse-output
+             (str "[[ ## reasoning ## ]]\nanalysis complete. "
+                  "[[ ## related-pairs ## ]]\n"
+                  "[{\"concept1\":\"Priority Channel\","
+                  "\"concept2\":\"Normal Channel\","
+                  "\"reason\":\"complementary tiers\"}]")
+             {:outputs [{:name :reasoning :spec :string}
+                        {:name :related-pairs
+                         :spec [:vector [:map
+                                         [:concept1 :string]
+                                         [:concept2 :string]
+                                         [:reason :string]]]}]})))))
+
 ;; ===========================================================================
 ;; 3. VALUE POSITION — the value may sit on the marker line
 ;; ===========================================================================
