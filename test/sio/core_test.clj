@@ -1174,11 +1174,18 @@
               "[[ ## is_true ## ]]\nTrue\n\n[[ ## note ## ]]\nbecause\n"
               {:outputs [{:name :is_true :spec :boolean} {:name :note :spec :string}]}
               {:is_true true :note "because"}]
-             ["boolean spellings (today's coercion, unchanged here)"
+             ;; The ONE row of this corpus whose expectation moved, and the only
+             ;; one that is not about field names. SIO-5 pinned it as
+             ;; "today's coercion, unchanged here" — `Yes` and `**True**` each
+             ;; produced `false`, a value the model never wrote, indistinguishably
+             ;; from a real `false`. That fabrication is the defect fixed here;
+             ;; see sio.marker-block-contract-test. Marker extraction for these
+             ;; rows is unchanged — only the coerced value is.
+             ["boolean spellings — an uninterpretable one is nil, never a fabricated false"
               "[[ ## a ## ]]\ntrue\n\n[[ ## b ## ]]\nYes\n\n[[ ## c ## ]]\n**True**\n"
               {:outputs [{:name :a :spec :boolean} {:name :b :spec :boolean}
                          {:name :c :spec :boolean}]}
-              {:a true :b false :c false}]
+              {:a true :b nil :c nil}]
              ["int and double"
               "[[ ## count ## ]]\n42\n\n[[ ## score ## ]]\n0.75\n"
               {:outputs [{:name :count :spec :int} {:name :score :spec :double}]}
