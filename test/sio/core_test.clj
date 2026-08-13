@@ -1,5 +1,5 @@
 (ns sio.core-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.test :refer [are deftest is testing]]
             [clojure.string :as str]
             [sio.core :as sio]))
 
@@ -365,6 +365,82 @@
     (is (= "json array (unique items)" (sio/spec->type-str :set)))
     (is (= "json array" (sio/spec->type-str :tuple)))
     (is (= "any" (sio/spec->type-str :any)))))
+
+(defn- rendered-enum-members
+  "The members of a rendered `one of: …` type string, as the model reads them."
+  [spec]
+  (let [s (sio/spec->type-str spec)
+        prefix "one of: "]
+    (assert (str/starts-with? s prefix) (str "not an enum rendering: " (pr-str s)))
+    (str/split (subs s (count prefix)) #", ")))
+
+(deftest keyword-enum-renders-its-value-not-its-printed-form-test
+  (testing "a keyword enum member renders without its leading colon"
+    (is (= "one of: add, support"
+           (sio/spec->type-str [:enum :add :support]))))
+
+  (testing "the rendered prompt never shows the model a colon-spelled member"
+    (let [prompt (sio/spec->prompt
+                  {:inputs [{:name :question :spec :string}]
+                   :outputs [{:name :op
+                              :spec [:enum :add :support]
+                              :description "what to do"}]})]
+      (is (str/includes? prompt "one of: add, support"))
+      (is (not (str/includes? prompt ":add")))
+      (is (not (str/includes? prompt ":support"))))))
+
+(deftest enum-rendering-agrees-with-the-emitted-json-schema-test
+  (testing "a namespaced keyword member keeps its namespace"
+    (is (= "one of: op/add, op/support"
+           (sio/spec->type-str [:enum :op/add :op/support]))))
+
+  (testing "the prompt and the JSON schema name the same members, spelled the same"
+    ;; The two renderings of one spec are asserted against EACH OTHER, not
+    ;; against two hand-written literals. Disagreement between what sio asks a
+    ;; model to write and what sio declares it will accept is the defect class;
+    ;; a member spelled `:add` in the prompt and `"add"` in the schema is one
+    ;; contract, stated two ways, that no model can satisfy both of.
+    (doseq [spec [[:enum :add :support]
+                  [:enum :op/add :op/support]
+                  [:enum "add" "support"]]]
+      (is (= (:enum (sio/malli-spec->json-schema spec))
+             (rendered-enum-members spec))
+          (pr-str spec)))))
+
+(deftest nested-keyword-enum-renders-through-the-same-branch-test
+  (testing "an optional keyword enum"
+    (is (= "one of: add, support or null"
+           (sio/spec->type-str [:maybe [:enum :add :support]]))))
+
+  (testing "a repeated keyword enum"
+    (is (= "json array of one of: add, support"
+           (sio/spec->type-str [:vector [:enum :add :support]]))))
+
+  (testing "a keyword enum as a map field"
+    (is (= "json {op: one of: add, support, why: str}"
+           (sio/spec->type-str [:map [:op [:enum :add :support]] [:why :string]]))))
+
+  (testing "a keyword enum as a union branch"
+    (is (= "one of: add, support or str"
+           (sio/spec->type-str [:or [:enum :add :support] :string])))))
+
+(deftest non-keyword-enum-members-render-exactly-as-before-test
+  (testing "every member spelling that is not a keyword is byte-identical"
+    ;; These strings were captured from the previous rendering. Only a keyword
+    ;; member changes; a string that merely LOOKS like a keyword does not.
+    (are [expected spec] (= expected (sio/spec->type-str spec))
+      "one of: a, b, c"                  [:enum "a" "b" "c"]
+      "one of: add, support"             [:enum "add" "support"]
+      "one of: 1, 2, 3"                  [:enum 1 2 3]
+      "one of: true, false"              [:enum true false]
+      "one of: add, 1, sym, "            [:enum "add" 1 'sym nil]
+      "one of: :add, support"            [:enum ":add" "support"]
+      "one of: a, b or null"             [:maybe [:enum "a" "b"]]
+      "json array of one of: a, b"       [:vector [:enum "a" "b"]]))
+
+  (testing "a mixed enum strips the colon from the keyword and nothing else"
+    (is (= "one of: add, 2, support, true"
+           (sio/spec->type-str [:enum :add 2 "support" true])))))
 
 (deftest parse-json-output-test
   (testing "Parse JSON object output"
