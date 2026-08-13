@@ -248,6 +248,15 @@
     {:outputs [{:name :a :spec :string} {:name :b :spec :string}]}
     {:a nil :b nil}]])
 
+(deftest a-nil-response-is-nil-fields-not-a-nullpointerexception-test
+  ;; Disclosed micro-change that rides with the extraction rewrite. A provider
+  ;; can return a nil message content, and previously that threw NPE out of
+  ;; `parse-output` — an unclassified exception that loses the usage, the model
+  ;; and the field-level detail a caller needs. Nothing was read, so every
+  ;; declared field is nil: the same shape as any other unreadable response.
+  (testing "no content at all is every declared field nil"
+    (is (= {:a nil :b nil} (sio/parse-output nil two-strings)))))
+
 (deftest well-formed-responses-parse-unchanged-test
   (doseq [[label response spec expected] well-formed-corpus]
     (testing label
