@@ -48,6 +48,7 @@ A **field** is a map:
 {:name        :answer        ; keyword identifier
  :spec        :string        ; a Malli schema — the field's type
  :description "The answer"   ; human-readable hint (optional)
+ :optional    true           ; field may be absent (optional)
  :type        :image}        ; optional; :image marks a multimodal input
 ```
 
