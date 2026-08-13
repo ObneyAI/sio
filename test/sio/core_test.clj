@@ -1038,3 +1038,206 @@
           ":maybe wraps the WHOLE union — comma disambiguates the null from the branches")
       (is (= "str" (render :string))
           "non-union rendering unchanged — parity with DSCloj holds everywhere else"))))
+
+;; =============================================================================
+;; Field names in the marker protocol (D0)
+;;
+;; sio renders the output contract and parses it back. Those two halves must
+;; agree about what a field NAME is. The tests below drive the agreement as a
+;; ROUND TRIP: the response fed to `parse-output` is built from `spec->prompt`'s
+;; own rendering, never written by hand, so the two halves are compared against
+;; each other rather than against a fixture that could encode either one's bug.
+;; =============================================================================
+
+(def ^:private interaction-header
+  "All interactions will be structured in the following way, with the appropriate values filled in.\n\n")
+
+(defn- outputs-only-spec
+  "A spec with no inputs and no instructions, so the interaction-format section
+   `spec->prompt` emits is exactly the OUTPUT stanzas — usable verbatim as the
+   body of a canonical model response. All fields are :string so the NAME is the
+   only variable under test."
+  [names]
+  {:outputs (mapv (fn [n] {:name n :spec :string
+                           :description (str "Field " (clojure.core/name n))})
+                  names)})
+
+(defn- response-from-rendered-prompt
+  "Build a canonical model response FROM sio's own rendering of `spec`: take the
+   interaction-format block out of the rendered prompt and fill each `{field}`
+   placeholder with that field's value. `str/replace` with a String match is a
+   LITERAL replacement — using a regex here would reintroduce the bug under test."
+  [spec values]
+  (let [prompt (sio/spec->prompt spec)
+        idx (str/index-of prompt interaction-header)]
+    (is (some? idx) "spec->prompt must emit an interaction-format section")
+    (reduce (fn [s {nm :name}]
+              (str/replace s (str "{" (clojure.core/name nm) "}") (get values nm)))
+            (subs prompt (+ idx (count interaction-header)))
+            (:outputs spec))))
+
+(defn- round-trips?
+  "True when `field` survives render -> respond -> parse. Probed alongside a
+   sentinel field so the single-string whole-text fallback (which would return
+   the whole response and mask an extraction failure) cannot fire."
+  [field]
+  (let [sentinel :sio-round-trip-sentinel
+        spec (outputs-only-spec [field sentinel])
+        values {field "THE-VALUE" sentinel "SENTINEL"}
+        response (response-from-rendered-prompt spec values)]
+    (try
+      (let [parsed (sio/parse-output response spec)]
+        (and (= "THE-VALUE" (get parsed field))
+             (= "SENTINEL" (get parsed sentinel))))
+      ;; A name that is spliced into a regex unquoted can produce an INVALID
+      ;; pattern (`*earmuffs*` -> dangling quantifier) or a pattern whose capture
+      ;; group never participates (`pipe|d` -> nil group -> NPE). Both are
+      ;; "does not round-trip", and both are worse than nil for a caller.
+      (catch Throwable _ false))))
+
+;; `?` is merely the character that bit us — Clojure's predicate convention puts
+;; it on the end of every boolean name. The CLASS is "regex metacharacter", and
+;; Clojure names also admit `*` (earmuffs), `+` and `.`. The rest are names a
+;; caller can construct programmatically via `keyword`, and sio's public API
+;; accepts them.
+(def ^:private regex-metacharacter-field-names
+  (mapv keyword
+        ["plain" "kebab-case" "snake_case" "digits2" "dot.ted"
+         "evidence-sufficient?" "response-satisfies?" "research-sufficient?"
+         "*earmuffed*" "plus+" "paren(s)" "brack[et]" "pipe|d"
+         "caret^" "dollar$" "brace{1}" "back\\slash"]))
+
+;; Field names taken from a real production consumer's declared output fields —
+;; ordinary domain vocabulary, not invented for this test. Three of them use
+;; Clojure's `?` predicate convention, which is exactly the case that broke.
+(def ^:private production-field-names
+  (mapv keyword
+        ["avoid-when" "capabilities" "evidence-gaps" "evidence-sufficient?"
+         "grounded-verdict" "operations" "representative-uses" "reranked-json"
+         "research-sufficient?" "research-target-selection"
+         "research-target-selection-2" "response-satisfies?" "satisfaction-gaps"
+         "strengths" "summary" "weaknesses"]))
+
+(deftest marker-round-trip-survives-every-field-name-test
+  (testing "a field name containing a regex metacharacter still round-trips"
+    (doseq [f regex-metacharacter-field-names]
+      (is (round-trips? f)
+          (str "field name does not survive render -> respond -> parse: "
+               (pr-str f)))))
+
+  (testing "every field name a real consumer declares round-trips"
+    (doseq [f production-field-names]
+      (is (round-trips? f)
+          (str "production field name does not survive the round trip: "
+               (pr-str f)))))
+
+  (testing "all production names in ONE spec — the real multi-marker shape"
+    (let [spec (outputs-only-spec production-field-names)
+          values (into {} (map (fn [n] [n (str "V-" (clojure.core/name n))]))
+                       production-field-names)
+          response (response-from-rendered-prompt spec values)]
+      (is (= values (sio/parse-output response spec))
+          "every declared field must come back from a response sio itself shaped"))))
+
+(deftest field-name-is-matched-literally-not-as-a-pattern-test
+  (testing "a name is field IDENTITY, never a pattern: `a.c` must not match `abc`"
+    ;; Unquoted splicing makes `.` a wildcard, so `a.c` silently claims another
+    ;; field's marker and value — the wrong-value failure mode of the same defect.
+    (let [spec {:outputs [{:name (keyword "a.c") :spec :string}
+                          {:name :sentinel :spec :string}]}
+          response "[[ ## abc ## ]]\nWRONG-FIELDS-VALUE\n\n[[ ## sentinel ## ]]\ns\n"]
+      (is (= {(keyword "a.c") nil :sentinel "s"} (sio/parse-output response spec)))))
+
+  (testing "an invalid-as-a-regex name does not blow up the parse"
+    (let [spec {:outputs [{:name (keyword "*x*") :spec :string}
+                          {:name :sentinel :spec :string}]}]
+      (is (= {(keyword "*x*") "v" :sentinel "s"}
+             (sio/parse-output "[[ ## *x* ## ]]\nv\n\n[[ ## sentinel ## ]]\ns\n" spec)))))
+
+  (testing "an alternation in a name does not produce a nil capture group"
+    (let [spec {:outputs [{:name (keyword "pipe|d") :spec :string}
+                          {:name :sentinel :spec :string}]}]
+      (is (= {(keyword "pipe|d") "v" :sentinel "s"}
+             (sio/parse-output "[[ ## pipe|d ## ]]\nv\n\n[[ ## sentinel ## ]]\ns\n" spec))))))
+
+(deftest ordinary-field-names-parse-unchanged-test
+  (testing "well-formed responses for ordinary names parse exactly as before —
+            the field-name fix may only make previously-broken names work"
+    ;; Goldens captured from the parser BEFORE the quoting fix (see the SIO-5
+    ;; evidence log). Every row is a well-formed response for plain field names.
+    (doseq [[label response spec expected]
+            [["two string fields"
+              "[[ ## answer ## ]]\nParis\n\n[[ ## reason ## ]]\nIt is the capital.\n"
+              {:outputs [{:name :answer :spec :string} {:name :reason :spec :string}]}
+              {:answer "Paris" :reason "It is the capital."}]
+             ["boolean + string"
+              "[[ ## is_true ## ]]\nTrue\n\n[[ ## note ## ]]\nbecause\n"
+              {:outputs [{:name :is_true :spec :boolean} {:name :note :spec :string}]}
+              {:is_true true :note "because"}]
+             ["boolean spellings (today's coercion, unchanged here)"
+              "[[ ## a ## ]]\ntrue\n\n[[ ## b ## ]]\nYes\n\n[[ ## c ## ]]\n**True**\n"
+              {:outputs [{:name :a :spec :boolean} {:name :b :spec :boolean}
+                         {:name :c :spec :boolean}]}
+              {:a true :b false :c false}]
+             ["int and double"
+              "[[ ## count ## ]]\n42\n\n[[ ## score ## ]]\n0.75\n"
+              {:outputs [{:name :count :spec :int} {:name :score :spec :double}]}
+              {:count 42 :score 0.75}]
+             ["int with prose falls through to the string"
+              "[[ ## count ## ]]\nabout seven\n\n[[ ## x ## ]]\ny\n"
+              {:outputs [{:name :count :spec :int} {:name :x :spec :string}]}
+              {:count "about seven" :x "y"}]
+             ["enum stays a plain string"
+              "[[ ## op ## ]]\nadd\n\n[[ ## why ## ]]\nreason\n"
+              {:outputs [{:name :op :spec [:enum :add :support]} {:name :why :spec :string}]}
+              {:op "add" :why "reason"}]
+             ["vector of string (JSON)"
+              "[[ ## items ## ]]\n[\"a\", \"b\"]\n\n[[ ## note ## ]]\nn\n"
+              {:outputs [{:name :items :spec [:vector :string]} {:name :note :spec :string}]}
+              {:items ["a" "b"] :note "n"}]
+             ["vector cardinality repair for a bare scalar"
+              "[[ ## items ## ]]\n\"only-one\"\n\n[[ ## note ## ]]\nn\n"
+              {:outputs [{:name :items :spec [:vector :string]} {:name :note :spec :string}]}
+              {:items ["\"only-one\""] :note "n"}]
+             ["vector of map (JSON)"
+              "[[ ## rows ## ]]\n[{\"k\": 1}]\n\n[[ ## note ## ]]\nn\n"
+              {:outputs [{:name :rows :spec [:vector [:map [:k :int]]]}
+                         {:name :note :spec :string}]}
+              {:rows [{:k 1}] :note "n"}]
+             ["[:maybe :string] keeps today's \"null\" string"
+              "[[ ## maybe_v ## ]]\nnull\n\n[[ ## note ## ]]\nn\n"
+              {:outputs [{:name :maybe_v :spec [:maybe :string]} {:name :note :spec :string}]}
+              {:maybe_v "null" :note "n"}]
+             ["the completed marker is stripped"
+              "[[ ## answer ## ]]\nParis\n\n[[ ## reason ## ]]\ncapital\n\n[[ ## completed ## ]]\n"
+              {:outputs [{:name :answer :spec :string} {:name :reason :spec :string}]}
+              {:answer "Paris" :reason "capital"}]
+             ["tight markers [[##f##]]"
+              "[[##answer##]]\nParis\n\n[[##reason##]]\ncapital\n"
+              {:outputs [{:name :answer :spec :string} {:name :reason :spec :string}]}
+              {:answer "Paris" :reason "capital"}]
+             ["extra whitespace inside the markers"
+              "[[   ##   answer   ##   ]]\nParis\n\n[[ ## reason ## ]]\ncapital\n"
+              {:outputs [{:name :answer :spec :string} {:name :reason :spec :string}]}
+              {:answer "Paris" :reason "capital"}]
+             ["single string field with markers"
+              "[[ ## answer ## ]]\nParis\n"
+              {:outputs [{:name :answer :spec :string}]}
+              {:answer "Paris"}]
+             ["single string field, whole-text fallback"
+              "Paris is the capital of France."
+              {:outputs [{:name :answer :spec :string}]}
+              {:answer "Paris is the capital of France."}]
+             ["a declared field with no marker is nil"
+              "[[ ## answer ## ]]\nParis\n"
+              {:outputs [{:name :answer :spec :string} {:name :absent :spec :string}]}
+              {:answer "Paris" :absent nil}]
+             ["snake_case and kebab-case names"
+              "[[ ## snake_name ## ]]\ns\n\n[[ ## kebab-name ## ]]\nk\n"
+              {:outputs [{:name :snake_name :spec :string} {:name :kebab-name :spec :string}]}
+              {:snake_name "s" :kebab-name "k"}]
+             ["empty response"
+              ""
+              {:outputs [{:name :a :spec :string} {:name :b :spec :string}]}
+              {:a nil :b nil}]]]
+      (is (= expected (sio/parse-output response spec)) label))))
