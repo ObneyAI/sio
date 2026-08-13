@@ -519,6 +519,103 @@
         (str/replace #"\[\[\s*##\s*completed\s*##\s*\]\].*$" "")
         (str/trim))))
 
+;; ---------------------------------------------------------------------------
+;; The marker block
+;;
+;; A marker block is `[[ ## field-name ## ]]` followed by that field's value.
+;; It is the whole of the text protocol, and five things about it are contract.
+;; Each one below was, at some point, left implicit — and every one of those
+;; produced a measured failure in which a model answered correctly and the
+;; answer was lost or altered on the read side.
+;;
+;;   IDENTITY    The field name is matched LITERALLY, never as a pattern: it is
+;;               wrapped in \Q...\E. Splicing it raw made every regex
+;;               metacharacter in a name active, and `spec->prompt` renders the
+;;               same name into the prompt — so sio could not match its own
+;;               rendered marker. Clojure's predicate convention alone
+;;               (`:evidence-sufficient?`) turned the trailing `t?` into an
+;;               optional `t`, leaving nothing that could match a literal
+;;               `? ##`. `*` compiled to an invalid pattern and threw
+;;               PatternSyntaxException; `|` threw NullPointerException; `.`
+;;               silently matched a DIFFERENT field's marker.
+;;
+;;   DELIMITERS  `[[` and `]]` tolerate whitespace BETWEEN the brackets — the
+;;               same tolerance the pattern always gave the `##` pair. Requiring
+;;               the brackets to be adjacent while tolerating `\s*` everywhere
+;;               else is an accident, not a design: 23 of 23 captured
+;;               unparseable responses from one production node had written
+;;               `[[ ## avoid-when ## ] ]`, and the drifted opening `[ [` is
+;;               worse still — the PREVIOUS field silently swallows the rest.
+;;
+;;   START       A block starts a LINE (leading whitespace allowed). Models
+;;               indent their markers (9 of 15 responses from one model), and
+;;               an indented marker that is not recognised is invisible as a
+;;               terminator, so the previous field swallows the remainder.
+;;               Requiring a line start is what keeps this tolerance from also
+;;               matching a marker QUOTED inside prose, which models also do.
+;;
+;;   EXTENT      The value runs to the next block's start, or to the end of the
+;;               text, and it may begin on the marker's own line
+;;               (`[[ ## f ## ]] value`) rather than the next.
+;;
+;;   OCCURRENCE  The LAST block for a field is the answer. A model's reasoning
+;;               drafts the output template — often several times, often
+;;               indented — before it writes the real one; taking the first
+;;               match returns the SCRATCHPAD. Measured over 30 captured
+;;               responses: 10 returned reasoning text rather than the answer,
+;;               silently.
+;;
+;; START, EXTENT and OCCURRENCE are all restorations of upstream (DSPy's
+;; ChatAdapter matches `line.strip()`, keeps `line[match.end():]` as content,
+;; and assembles sections into a dict so later ones replace earlier ones).
+;; DELIMITER tolerance is a deliberate divergence: upstream is stricter, but
+;; upstream also RAISES where sio returns nil, so strictness costs it less.
+;; ---------------------------------------------------------------------------
+
+(defn- marker-block-pattern
+  "Regex matching one marker block for `field-name` and capturing its value."
+  [field-name]
+  (re-pattern
+   (str "(?:\\A|\\n)[ \\t]*"                        ; START: the block begins a line
+        "\\[\\s*\\[\\s*##\\s*"                      ; DELIMITER: opening
+        (java.util.regex.Pattern/quote (name field-name))  ; IDENTITY: literal
+        "\\s*##\\s*\\]\\s*\\]"                      ; DELIMITER: closing
+        "[ \\t]*\\n?"                               ; EXTENT: value starts here…
+        "([\\s\\S]*?)"                              ; …or on the following line
+        "(?=\\n[ \\t]*\\[\\s*\\[\\s*##|$)")))       ; EXTENT: to the next block
+
+(def ^:private true-spellings
+  "Spellings that mean TRUE. `True` is what `spec->type-str` renders into the
+   prompt (\"must be True or False\"); `true` is JSON's, which the same prompt
+   asks for on every complex field and which models therefore reach for; `TRUE`
+   is kept for symmetry with the pair below. Nothing else is accepted — a
+   spelling the prompt never taught can only be reached by ignoring it, and
+   guessing at intent is the generator of the defect this set exists to fix."
+  #{"true" "True" "TRUE"})
+
+(def ^:private false-spellings
+  "The mirror of `true-spellings`. These previously produced `false` only by
+   ACCIDENT — they fell through to a default — which made them indistinguishable
+   from junk. They are now honoured by contract."
+  #{"false" "False" "FALSE"})
+
+(defn- coerce-boolean
+  "A declared boolean is `true`, `false`, or NOTHING.
+
+   The defect this replaces returned `false` for every value outside a
+   three-element set. `false` is a VALID boolean, so the fabricated value
+   validated, reached the caller, and was reported a success: a model wrote
+   `true` and the caller stored `false`, with no error anywhere. An
+   uninterpretable value is therefore nil — a declared field with no value —
+   which callers already treat as a failure to extract, and which cannot be
+   mistaken for an answer."
+  [value]
+  (let [v (str/trim value)]
+    (cond
+      (contains? true-spellings v) true
+      (contains? false-spellings v) false
+      :else nil)))
+
 (defn parse-output
   "Parse LLM output based on a spec's output field definitions.
 
@@ -527,8 +624,13 @@
   - spec: The spec with :outputs
 
   Returns a map with output field names as keys and parsed, type-coerced values.
-  For complex specs (maps, vectors), parses JSON responses; booleans/ints/floats
-  are coerced from their string form; enums stay plain strings.
+  For complex specs (maps, vectors), parses JSON responses; ints/floats are
+  coerced from their string form; enums stay plain strings.
+
+  A declared field with no readable value is nil. In particular a BOOLEAN whose
+  value is neither a true- nor a false-spelling is nil rather than `false`: a
+  fabricated `false` is a valid value and would be indistinguishable from an
+  answer. See the marker-block contract above for what counts as a block.
 
   Single-field fallback: when a spec has exactly one string-typed output and the
   model wrote plain prose without the field markers, the whole response becomes
@@ -538,30 +640,13 @@
     (parse-output llm-response {:outputs [{:name :answer :spec :string}
                                           {:name :confidence :spec :boolean}]})"
   [response {:keys [outputs]}]
-  (let [;; Extract content between [[ ## field_name ## ]] or [[##field_name##]] markers.
-        ;;
-        ;; The field name is field IDENTITY, so it is matched LITERALLY: it is
-        ;; wrapped in \Q...\E (Pattern/quote) before being spliced into the
-        ;; pattern. Splicing it raw made every regex metacharacter in a name
-        ;; active, and `spec->prompt` renders the very same name into the prompt
-        ;; — so sio could not match its own rendered marker. Clojure's predicate
-        ;; convention alone (`:evidence-sufficient?`) made the trailing `t?` an
-        ;; optional `t`, leaving nothing that could match a literal `? ##`; the
-        ;; field became permanently unextractable. The class is wider than `?`:
-        ;; `*` (earmuffs) compiled to an INVALID pattern and threw
-        ;; PatternSyntaxException, `|` produced a non-participating capture group
-        ;; and threw NullPointerException, and `.` silently matched a DIFFERENT
-        ;; field's marker. Only the name is quoted — the marker's own delimiters
-        ;; and whitespace tolerance are untouched.
-        extract-field (fn [field-name text]
-                        (let [pattern (re-pattern (str "\\[\\[\\s*##\\s*"
-                                                       (java.util.regex.Pattern/quote (name field-name))
-                                                       "\\s*##\\s*\\]\\]\\s*\\n([\\s\\S]*?)(?=\\n\\[\\[\\s*##|$)"))
-                              match (re-find pattern text)]
-                          (when match
-                            (-> (second match)
-                                (str/trim)
-                                (strip-completion-marker)))))
+  (let [extract-field (fn [field-name text]
+                        ;; OCCURRENCE: the last block wins — see above.
+                        (when-let [match (last (re-seq (marker-block-pattern field-name)
+                                                       (or text "")))]
+                          (-> (second match)
+                              (str/trim)
+                              (strip-completion-marker))))
 
         ;; Get base type from spec (unwrap [:string {:min 1}] -> :string)
         base-type (fn [spec]
@@ -589,7 +674,7 @@
 
                             ;; Booleans
                             (#{:boolean 'boolean?} base)
-                            (contains? #{"True" "true" "TRUE"} value)
+                            (coerce-boolean value)
 
                             ;; Integers
                             (#{:int 'int?} base)
