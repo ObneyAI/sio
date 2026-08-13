@@ -538,9 +538,25 @@
     (parse-output llm-response {:outputs [{:name :answer :spec :string}
                                           {:name :confidence :spec :boolean}]})"
   [response {:keys [outputs]}]
-  (let [;; Extract content between [[ ## field_name ## ]] or [[##field_name##]] markers
+  (let [;; Extract content between [[ ## field_name ## ]] or [[##field_name##]] markers.
+        ;;
+        ;; The field name is field IDENTITY, so it is matched LITERALLY: it is
+        ;; wrapped in \Q...\E (Pattern/quote) before being spliced into the
+        ;; pattern. Splicing it raw made every regex metacharacter in a name
+        ;; active, and `spec->prompt` renders the very same name into the prompt
+        ;; — so sio could not match its own rendered marker. Clojure's predicate
+        ;; convention alone (`:evidence-sufficient?`) made the trailing `t?` an
+        ;; optional `t`, leaving nothing that could match a literal `? ##`; the
+        ;; field became permanently unextractable. The class is wider than `?`:
+        ;; `*` (earmuffs) compiled to an INVALID pattern and threw
+        ;; PatternSyntaxException, `|` produced a non-participating capture group
+        ;; and threw NullPointerException, and `.` silently matched a DIFFERENT
+        ;; field's marker. Only the name is quoted — the marker's own delimiters
+        ;; and whitespace tolerance are untouched.
         extract-field (fn [field-name text]
-                        (let [pattern (re-pattern (str "\\[\\[\\s*##\\s*" (name field-name) "\\s*##\\s*\\]\\]\\s*\\n([\\s\\S]*?)(?=\\n\\[\\[\\s*##|$)"))
+                        (let [pattern (re-pattern (str "\\[\\[\\s*##\\s*"
+                                                       (java.util.regex.Pattern/quote (name field-name))
+                                                       "\\s*##\\s*\\]\\]\\s*\\n([\\s\\S]*?)(?=\\n\\[\\[\\s*##|$)"))
                               match (re-find pattern text)]
                           (when match
                             (-> (second match)
