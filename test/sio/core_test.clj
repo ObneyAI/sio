@@ -402,10 +402,45 @@
     ;; contract, stated two ways, that no model can satisfy both of.
     (doseq [spec [[:enum :add :support]
                   [:enum :op/add :op/support]
-                  [:enum "add" "support"]]]
+                  [:enum "add" "support"]
+                  ;; The same three specs, each carrying a Malli properties
+                  ;; map. The schema puts the properties beside the members;
+                  ;; the type string must list the members only.
+                  [:enum {:description "x"} :add :support]
+                  [:enum {:description "x"} :op/add :op/support]
+                  [:enum {:description "x"} "add" "support"]]]
       (is (= (:enum (sio/malli-spec->json-schema spec))
              (rendered-enum-members spec))
           (pr-str spec)))))
+
+(deftest enum-properties-map-is-not-a-member-test
+  (testing "a Malli properties map does not render as a choice"
+    (is (= "one of: a, b"
+           (sio/spec->type-str [:enum {:description "x"} "a" "b"])))
+    (is (= "one of: add, support"
+           (sio/spec->type-str [:enum {:description "x"} :add :support])))
+    (is (= "one of: op/add, op/support"
+           (sio/spec->type-str [:enum {:description "x"} :op/add :op/support]))))
+
+  (testing "the properties map is dropped through nesting too"
+    (is (= "one of: add, support or null"
+           (sio/spec->type-str [:maybe [:enum {:description "x"} :add :support]])))
+    (is (= "json array of one of: a, b"
+           (sio/spec->type-str [:vector [:enum {:description "x"} "a" "b"]]))))
+
+  (testing "a leading map is Malli's properties, and both renderings read it that way"
+    ;; Malli resolves [:enum {:a 1} {:b 2}] to properties {:a 1} with a single
+    ;; member. The type string follows Malli rather than guessing differently.
+    (is (= "one of: {:b 2}"
+           (sio/spec->type-str [:enum {:a 1} {:b 2}])))
+    (is (= [{:b 2}]
+           (:enum (sio/malli-spec->json-schema [:enum {:a 1} {:b 2}])))))
+
+  (testing "a childless enum still renders instead of throwing"
+    ;; Malli rejects both of these, and `malli-spec->json-schema` throws on
+    ;; them. Rendering a prompt stays total, so this branch must not throw.
+    (is (= "one of: " (sio/spec->type-str [:enum])))
+    (is (= "one of: " (sio/spec->type-str [:enum {:description "x"}])))))
 
 (deftest nested-keyword-enum-renders-through-the-same-branch-test
   (testing "an optional keyword enum"
