@@ -562,12 +562,10 @@
 ;;               `[[ ## avoid-when ## ] ]`, and the drifted opening `[ [` is
 ;;               worse still — the PREVIOUS field silently swallows the rest.
 ;;
-;;   START       A block starts a LINE (leading whitespace allowed). Models
-;;               indent their markers (9 of 15 responses from one model), and
-;;               an indented marker that is not recognised is invisible as a
-;;               terminator, so the previous field swallows the remainder.
-;;               Requiring a line start is what keeps this tolerance from also
-;;               matching a marker QUOTED inside prose, which models also do.
+;;   START       A block normally starts a LINE (leading whitespace allowed),
+;;               but providers also append the real output marker after prose
+;;               on the same line. An unquoted marker following whitespace is
+;;               therefore a block; a backtick-quoted marker remains prose.
 ;;
 ;;   EXTENT      The value runs to the next block's start, or to the end of the
 ;;               text, and it may begin on the marker's own line
@@ -591,13 +589,13 @@
   "Regex matching one marker block for `field-name` and capturing its value."
   [field-name]
   (re-pattern
-   (str "(?:\\A|\\n)[ \\t]*"                        ; START: the block begins a line
+   (str "(?:\\A|\\n[ \\t]*|[ \\t]+(?=\\[))"       ; START: line or unquoted inline
         "\\[\\s*\\[\\s*##\\s*"                      ; DELIMITER: opening
         (java.util.regex.Pattern/quote (name field-name))  ; IDENTITY: literal
         "\\s*##\\s*\\]\\s*\\]"                      ; DELIMITER: closing
         "[ \\t]*\\n?"                               ; EXTENT: value starts here…
         "([\\s\\S]*?)"                              ; …or on the following line
-        "(?=\\n[ \\t]*\\[\\s*\\[\\s*##|$)")))       ; EXTENT: to the next block
+        "(?=(?:\\n[ \\t]*|[ \\t]+)\\[\\s*\\[\\s*##|$)"))) ; EXTENT: to next block
 
 (def ^:private true-spellings
   "Spellings that mean TRUE. `True` is what `spec->type-str` renders into the
