@@ -99,14 +99,24 @@
     (and (vector? spec) (#{:vector :sequential} (first spec)))
     (str "json array of " (spec->type-str (second spec)))
 
-    ;; Enum - list options. A keyword member is rendered as its VALUE, not its
-    ;; printed form: `str` on a keyword keeps the leading colon, so the model was
-    ;; told `one of: :add, :support` and wrote `":support"` back. The colon is
+    ;; Enum - list the members, and only the members.
+    ;;
+    ;; A leading map is Malli's properties map, not a choice, so it is skipped
+    ;; the same way the :or branch below skips it. The guard is `map?` on the
+    ;; form rather than `m/children` on a compiled schema, because the two agree
+    ;; on every spec Malli accepts, and because rendering a prompt stays total:
+    ;; `m/children` throws on `[:enum]`, which this branch renders today.
+    ;;
+    ;; A keyword member is rendered as its VALUE, not its printed form. `str` on
+    ;; a keyword keeps the leading colon, so the model was told
+    ;; `one of: :add, :support` and wrote `":support"` back. The colon is
     ;; stripped rather than `name` taken, because `name` would also drop the
     ;; namespace and put this rendering back out of step with the enum that
     ;; `malli-spec->json-schema` emits for the same spec (`"op/add"`).
     (and (vector? spec) (= :enum (first spec)))
-    (str "one of: " (str/join ", " (map #(if (keyword? %) (subs (str %) 1) (str %)) (rest spec))))
+    (let [members (cond-> (rest spec)
+                    (map? (second spec)) rest)]
+      (str "one of: " (str/join ", " (map #(if (keyword? %) (subs (str %) 1) (str %)) members))))
 
     ;; Maybe - nullable. A union child gets a comma before the null so the null
     ;; reads as an alternative to the WHOLE union, not to its last branch.
