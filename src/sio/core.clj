@@ -159,10 +159,13 @@
   Returns output-map if valid, throws exception if invalid."
   [fields output-map]
   (doseq [field fields]
-    (let [{:keys [name spec]} field]
+    (let [{:keys [name spec optional]} field]
       (when spec
-        (when-let [value (get output-map name)]
-          (validate-field field value)))))
+        (if (contains? output-map name)
+          (validate-field field (get output-map name))
+          (when-not optional
+            (throw (ex-info (str "Missing required output field " name)
+                            {:field name :spec spec :output-map output-map})))))))
   output-map)
 
 (defn- strip-markdown-code-block
@@ -350,7 +353,9 @@
                            [(clojure.core/name name)
                             (cond-> (malli-spec->json-schema spec)
                               description (assoc :description description))]))
-        required (mapv #(clojure.core/name (:name %)) outputs)]
+        required (->> outputs
+                      (remove :optional)
+                      (mapv #(clojure.core/name (:name %))))]
     {:type "function"
      :function {:name "submit_response"
                 :description (or instructions "Submit the structured response")
@@ -380,10 +385,15 @@
         ;; Convert string keys to keyword keys matching output names
         (when parsed
           (into {}
-                (for [{:keys [name]} outputs
-                      :let [k (keyword (clojure.core/name name))
-                            v (get parsed k (get parsed (clojure.core/name name)))]]
-                  [name v])))))))
+                (keep (fn [{:keys [name optional]}]
+                        (let [keyword-name (keyword (clojure.core/name name))
+                              string-name (clojure.core/name name)]
+                          (cond
+                            (contains? parsed keyword-name) [name (get parsed keyword-name)]
+                            (contains? parsed string-name) [name (get parsed string-name)]
+                            optional nil
+                            :else [name nil]))))
+                outputs))))))
 
 ;; =============================================================================
 ;; Prompt Rendering
@@ -405,9 +415,10 @@
   Returns a formatted prompt string."
   [spec]
   (let [{:keys [inputs outputs instructions]} spec
-        format-field (fn [idx {:keys [name spec description]}]
+        format-field (fn [idx {:keys [name spec description optional]}]
                        (let [type-str (spec->type-str spec)]
-                         (str (inc idx) ". `" (clojure.core/name name) "` (" type-str "): " description)))
+                         (str (inc idx) ". `" (clojure.core/name name) "` (" type-str
+                              (when optional ", optional") "): " description)))
 
         ;; Input fields section (exclude image inputs — they're sent as content parts, not text)
         text-inputs (remove #(= :image (:type %)) inputs)
@@ -554,10 +565,13 @@
 
                             :else value)))
         parsed (into {}
-                     (for [{:keys [name spec]} outputs]
-                       (let [raw-value (extract-field name response)
-                             converted-value (convert-value raw-value spec)]
-                         [name converted-value])))]
+                     (keep (fn [{:keys [name spec optional]}]
+                             (let [raw-value (extract-field name response)]
+                               (cond
+                                 (some? raw-value) [name (convert-value raw-value spec)]
+                                 optional nil
+                                 :else [name nil]))))
+                     outputs)]
     ;; Single-field fallback: models answering a one-output-field spec
     ;; often write plain prose and skip the field markers entirely —
     ;; especially under long task instructions. When that single field is

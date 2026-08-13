@@ -99,6 +99,12 @@
       (is (= 0.98 (:confidence result)))
       (is (true? (:is_confident result)))))
 
+  (testing "Omitted optional marker outputs remain absent"
+    (let [spec {:outputs [{:name :action :spec :string}
+                          {:name :reply :spec :string :optional true}]}
+          result (sio/parse-output "[[ ## action ## ]]\ninvoke" spec)]
+      (is (= {:action "invoke"} result))))
+
   (testing "Parse output with extra whitespace"
     (let [spec {:outputs [{:name :answer :spec :string}]}
           response "[[ ## answer ## ]]\n  Paris  \n"
@@ -225,6 +231,25 @@
     (let [fields [{:name :score :spec :double}]
           output {:score "high"}]
       (is (thrown? Exception (sio/validate-outputs fields output))))))
+
+(deftest output-presence-validation-test
+  (testing "required output absence fails"
+    (is (thrown? Exception
+                 (sio/validate-outputs [{:name :answer :spec :string}] {}))))
+  (testing "optional output absence passes"
+    (is (= {}
+           (sio/validate-outputs
+            [{:name :answer :spec :string :optional true}]
+            {}))))
+  (testing "optional is distinct from nullable"
+    (is (thrown? Exception
+                 (sio/validate-outputs
+                  [{:name :answer :spec :string :optional true}]
+                  {:answer nil})))
+    (is (= {:answer nil}
+           (sio/validate-outputs
+            [{:name :answer :spec [:maybe :string] :optional true}]
+            {:answer nil})))))
 
 (deftest spec-with-malli-test
   (testing "Spec with Malli specs generates correct prompt"
@@ -595,6 +620,13 @@
              (get-in tool-def [:function :parameters :properties "valid"])))
       (is (= ["score" "valid"] (get-in tool-def [:function :parameters :required])))))
 
+  (testing "Optional outputs stay out of the required list"
+    (let [spec {:outputs [{:name :action :spec :string}
+                          {:name :reply :spec :string :optional true}]}
+          tool-def (sio/outputs->tool-definition spec)]
+      (is (= ["action"] (get-in tool-def [:function :parameters :required])))
+      (is (some? (get-in tool-def [:function :parameters :properties "reply"])))))
+
   (testing "Creates tool definition with complex output"
     (let [spec {:outputs [{:name :data
                            :spec [:map [:items [:vector :string]] [:count :int]]
@@ -660,6 +692,19 @@
     (let [outputs [{:name :label :spec :string}]
           response {:choices [{:message {:tool-calls [{:function {:arguments "{\"label\": \"spam\"}"}}]}}]}]
       (is (= {:label "spam"} (sio/parse-tool-call-response response outputs)))))
+
+  (testing "Omitted optional arguments remain absent"
+    (let [outputs [{:name :action :spec :string}
+                   {:name :reply :spec :string :optional true}]
+          response {:choices [{:message {:tool-calls [{:function {:arguments "{\"action\":\"invoke\"}"}}]}}]}]
+      (is (= {:action "invoke"}
+             (sio/parse-tool-call-response response outputs)))))
+
+  (testing "An explicit null remains present"
+    (let [outputs [{:name :reply :spec [:maybe :string] :optional true}]
+          response {:choices [{:message {:tool-calls [{:function {:arguments "{\"reply\":null}"}}]}}]}]
+      (is (= {:reply nil}
+             (sio/parse-tool-call-response response outputs)))))
 
   (testing "Malformed JSON arguments yield nil (parse failure is swallowed)"
     (let [outputs [{:name :answer :spec :string}]
