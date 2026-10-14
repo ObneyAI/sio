@@ -809,7 +809,13 @@
 
       1. `name` (type): meaning
 
-  Shown means present in the request's values, at any depth:
+  Shown means present in the request's values, at any depth. A complex value
+  may be the JSON text a caller sends it as: for an input with record fields
+  to explain, a string that is a JSON object or array is parsed (a JSON null is
+  a field present with no value; `ns/name` is the key `:ns/name`) and shown is
+  judged from the parsed value. A nested entry is matched by its declared key,
+  its JSON spelling (`name`, `ns/name`), or the keyword of that spelling. Text
+  that is not JSON leaves the input shown with nothing nested.
   - An input the request does not carry is neither explained nor listed. A field
     present with a nil value is shown. An absent nested field is neither
     explained nor listed anywhere, and a union explains only the branch the
@@ -903,12 +909,14 @@
   The input section is the input field guide (see `input-field-guide`).
 
   - `(spec->prompt spec input-values)` -- the guide explains the inputs this
-    request carries, per `input-values`, and no others.
+    request carries, per `input-values`, and no others; and the interaction
+    format names only those inputs too, so an input the request does not carry
+    appears nowhere in the prompt.
   - `(spec->prompt spec)` -- without the request's values every declared input
     is treated as shown, so the section is a complete account of the contract.
 
-  The output section, interaction-format markers and instruction section are
-  the same for both arities.
+  The output section, the output markers and the instruction section are the
+  same for both arities.
 
   Returns a formatted prompt string."
   ([spec]

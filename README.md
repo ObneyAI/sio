@@ -227,6 +227,12 @@ The guide explains what the model is **shown**, and nothing else:
   any depth. `coupon` and `account`'s `region` are absent here, so they are
   neither explained nor listed; a field present with a `nil` value is shown. A
   union explains only the branch the values are in.
+- **Values may be JSON text.** A caller often sends a complex input as JSON text.
+  For an input with record fields to explain, a string that is a JSON object or
+  array is read as that value: a nested entry is matched by its declared key or
+  its JSON spelling (`name`, `ns/name`), and a JSON `null` is a field present
+  with no value, so it is shown. Text that is not JSON leaves the input shown
+  with nothing nested.
 - **A collection's item fields are explained once.** Two messages, or two
   hundred, give one `each item:` line and the union of the fields the items
   carry (`sent-at` appears because one message has it).
@@ -241,19 +247,21 @@ The guide explains what the model is **shown**, and nothing else:
 - **Images are excluded.** An image input stays a content part (see
   `build-message-content`).
 
-`spec->prompt` takes the request's values as a second argument, and its input
-section *is* the guide:
+`spec->prompt` takes the request's values as a second argument. Its input
+section *is* the guide, and its interaction-format markers name only the inputs
+the request carries, so an input the model cannot see is named nowhere:
 
 ```clojure
 (sio/spec->prompt support {:subject "Refund please" :account {:tier "pro"}})
-;; => the guide, then the output section, the interaction-format markers and the
-;;    instructions
+;; => the guide, then the output section, the interaction-format markers (for
+;;    `subject` and `account` only) and the instructions
 ```
 
 `(sio/spec->prompt support)`, without values, keeps working: with no request to
-read, **every declared field is treated as shown**, at every depth, so the
-section is a complete account of the contract. The output section, the markers
-and the instruction section are the same for both forms.
+read, **every declared input is treated as shown**, at every depth, so the
+section is a complete account of the contract and the markers name every input.
+The output section, the output markers and the instruction section are the same
+for both forms.
 
 ## Nested data & forgiving parsing
 
