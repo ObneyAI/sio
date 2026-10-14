@@ -4,7 +4,8 @@
 
    Every test asserts what the model is shown (the rendered text), through the
    public interface, never how the renderer walks a schema."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [cheshire.core :as json]
+            [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
             [malli.core :as m]
             [sio.core :as sio]))
@@ -123,18 +124,24 @@
              {:name :score :spec [:maybe [:or :int :double]]}]
    :instructions "Triage the ticket.\nBe brief."})
 
-(def ^:private fixed-contract-tail-before-the-guide-existed
+(def ^:private golden-output-section
   (str "Your output fields are:\n"
        "1. `category` (one of: billing, bug): Primary topic\n"
        "2. `urgent` (bool): Is it urgent?\n"
        "3. `steps` (json array of str): Next steps\n"
        "4. `detail` (json {a: int, b?: str}): Detail\n"
-       "5. `score` (int or float, or null): \n"
-       "All interactions will be structured in the following way, with the appropriate values filled in.\n\n"
-       "[[ ## subject ## ]]\n{subject}\n\n"
-       "[[ ## history ## ]]\n{history}\n\n"
-       "[[ ## note ## ]]\n{note}\n\n"
-       "[[ ## category ## ]]\n{category}        # note: respond with just the value, no quotes\n\n"
+       "5. `score` (int or float, or null): \n"))
+
+(def ^:private golden-header
+  "All interactions will be structured in the following way, with the appropriate values filled in.\n\n")
+
+(def ^:private golden-input-markers
+  {:subject "[[ ## subject ## ]]\n{subject}\n\n"
+   :history "[[ ## history ## ]]\n{history}\n\n"
+   :note "[[ ## note ## ]]\n{note}\n\n"})
+
+(def ^:private golden-output-markers-and-instructions
+  (str "[[ ## category ## ]]\n{category}        # note: respond with just the value, no quotes\n\n"
        "[[ ## urgent ## ]]\n{urgent}        # note: the value you produce must be True or False\n\n"
        "[[ ## steps ## ]]\n{steps}        # note: respond with valid JSON\n\n"
        "[[ ## detail ## ]]\n{detail}        # note: respond with valid JSON\n\n"
@@ -142,16 +149,29 @@
        "[[ ## completed ## ]]\n"
        "In adhering to this structure, your instructions are: Triage the ticket.\nBe brief."))
 
+(defn- golden-tail
+  "Everything after the input section, as the renderer wrote it before the guide
+  existed, with the input markers of `shown-inputs` only."
+  [shown-inputs]
+  (str golden-output-section
+       golden-header
+       (apply str (map golden-input-markers shown-inputs))
+       golden-output-markers-and-instructions))
+
 (defn- after-input-section [prompt]
   (subs prompt (str/index-of prompt "Your output fields are:")))
 
 (deftest output-markers-and-instruction-sections-are-byte-identical-to-before-test
-  (testing "the one-argument form"
-    (is (= fixed-contract-tail-before-the-guide-existed
+  (testing "the one-argument form: all of it, input markers included"
+    (is (= (golden-tail [:subject :history :note])
            (after-input-section (sio/spec->prompt fixed-contract)))))
-  (testing "the two-argument form, for any set of values"
-    (doseq [values [{} {:subject "s"} {:subject "s" :history [{:who "a" :text "b"}] :note "n"}]]
-      (is (= fixed-contract-tail-before-the-guide-existed
+  (testing "the two-argument form: the same bytes, with the input markers of the shown inputs only"
+    (doseq [[values shown] [[{} []]
+                            [{:subject "s"} [:subject]]
+                            [{:note "n" :subject "s"} [:subject :note]]
+                            [{:subject "s" :history [{:who "a" :text "b"}] :note "n"} [:subject :history :note]]
+                            [{:photo "data:image/png;base64,abc"} []]]]
+      (is (= (golden-tail shown)
              (after-input-section (sio/spec->prompt fixed-contract values)))
           (pr-str values)))))
 
@@ -867,3 +887,191 @@
     (testing "the value fields of a map-of"
       (is (str/includes? section "each value:"))
       (is (str/includes? section "`value` (int): 0 to 10")))))
+
+;; =============================================================================
+;; Values as a caller really sends them: a complex input arrives as JSON TEXT.
+;;
+;; The text below is built by `json/generate-string` on keyword-keyed maps and
+;; vectors, exactly as a caller that serializes complex input values does: a
+;; keyword key becomes the string `name`, a qualified one `ns/name`, a nil
+;; becomes JSON null. A nil input itself arrives as "".
+;; =============================================================================
+
+(defn- sent
+  "A complex input value as it is sent to the model: JSON text."
+  [value]
+  (json/generate-string value))
+
+(def ^:private billing-case
+  {:name :case
+   :description "The case under review"
+   :spec [:map
+          [:status {:description "Where the case stands"} [:enum "open" "closed"]]
+          [:owner {:optional true :description "Staff member who holds the case"} :string]
+          [:opened-by {:description "Who opened the case"} :string]
+          [:billing/plan {:description "Subscription plan"} :string]
+          [:closed-at {:optional true :description "When it was closed"} [:maybe :string]]]})
+
+(deftest a-map-input-sent-as-json-text-has-its-shown-nested-fields-explained-test
+  (let [text (sent {:status "open" :opened-by "Bo" :billing/plan "pro" :closed-at nil})
+        guide (sio/input-field-guide [billing-case] {:case text})]
+    (testing "precondition: the value really is the text a JSON serializer writes"
+      (is (string? text))
+      (is (str/includes? text "\"billing/plan\":\"pro\""))
+      (is (str/includes? text "\"closed-at\":null")))
+    (testing "present fields are explained, including the qualified key and the JSON null"
+      (is (= (str "Your input fields are:\n"
+                  "1. `case` (json object): The case under review\n"
+                  "   1. `status` (one of: open, closed): Where the case stands\n"
+                  "   2. `opened-by` (str): Who opened the case\n"
+                  "   3. `billing/plan` (str): Subscription plan\n"
+                  "   4. `closed-at` (str or null, optional): When it was closed")
+             guide)))
+    (testing "the absent field is neither explained nor listed"
+      (is (not (str/includes? guide "owner")))
+      (is (not (str/includes? guide "Staff member who holds the case"))))))
+
+(deftest text-that-is-not-json-is-shown-with-nothing-nested-test
+  (let [shown-only (str "Your input fields are:\n"
+                        "1. `case` (json object): The case under review")]
+    (testing "a nil input arrives as the empty string"
+      (is (= shown-only (sio/input-field-guide [billing-case] {:case ""}))))
+    (testing "truncated JSON"
+      (is (= shown-only (sio/input-field-guide [billing-case] {:case "{\"status\":\"op"}))))
+    (testing "prose"
+      (is (= shown-only (sio/input-field-guide [billing-case] {:case "see the attached note"}))))
+    (testing "JSON that is not an object explains no field of an object"
+      (is (= shown-only (sio/input-field-guide [billing-case] {:case "[1,2,3]"}))))
+    (testing "a sibling input is still explained alongside the unparsable one"
+      (is (str/includes?
+           (sio/input-field-guide [billing-case {:name :note :spec :string :description "A note"}]
+                                  {:case "{oops" :note "x"})
+           "2. `note` (str): A note")))))
+
+(deftest a-collection-sent-as-json-text-explains-its-item-fields-once-test
+  (let [items [{:author-kind "human" :text "Hello"}
+               {:text "Thanks" :sent-at "2026-01-02"}
+               {:text "Bye" :sent-at nil}]
+        guide (sio/input-field-guide [messages-input] {:messages (sent items)})]
+    (testing "the union of the fields the items carry, once, in declared order; null is shown"
+      (is (= (str "Your input fields are:\n"
+                  "1. `messages` (json array of json object): The conversation so far, oldest first\n"
+                  "   each item: One message in the conversation\n"
+                  "      1. `author-kind` (one of: human, customer): human means a staff member, never the customer's own words\n"
+                  "      2. `text` (str): What was written\n"
+                  "      3. `sent-at` (str, optional): When it was sent")
+             guide)))
+    (testing "a field no item carries is neither explained nor listed"
+      (is (not (str/includes? guide "attachment")))
+      (is (not (str/includes? guide "Name of an attached file"))))
+    (testing "once for any number of items"
+      (let [many (sio/input-field-guide [messages-input]
+                                        {:messages (sent (vec (repeat 50 {:author-kind "customer" :text "Hi"})))})]
+        (is (= 1 (occurrences many "`author-kind`")))
+        (is (= 1 (occurrences many "never the customer's own words")))))))
+
+(deftest a-union-sent-as-json-text-shows-only-the-branch-its-value-is-in-test
+  (testing "branches told apart by a string field, as sent"
+    (let [guide (sio/input-field-guide [payment-input]
+                                       {:payment (sent {:iban "GB00" :reference "R-1"})})]
+      (is (str/includes? guide "`iban` (str): Bank account number") "precondition: the present branch")
+      (is (not (str/includes? guide "card-last4")))
+      (is (not (str/includes? guide "Last four digits of the card")))))
+
+  (testing "branches told apart by a keyword value: JSON writes :transfer as \"transfer\""
+    (let [by-kind {:name :payment
+                   :description "How the customer paid"
+                   :spec [:or
+                          [:map [:kind {:description "Payment kind"} [:= :card]]
+                           [:last4 {:description "Last four digits of the card"} :string]]
+                          [:map [:kind {:description "Payment kind"} [:= :transfer]]
+                           [:iban {:description "Bank account number"} :string]]]}
+          guide (sio/input-field-guide [by-kind] {:payment (sent {:kind :transfer :iban "GB00"})})]
+      (is (= (str "Your input fields are:\n"
+                  "1. `payment` (json object): How the customer paid\n"
+                  "   1. `kind` (str): Payment kind\n"
+                  "   2. `iban` (str): Bank account number")
+             guide))
+      (is (not (str/includes? guide "last4")))))
+
+  (testing "a dispatched union whose tags are keywords: the dispatch value arrives as a string"
+    (let [guide (sio/input-field-guide [dispatched-payment]
+                                       {:payment (sent {:kind :transfer :iban "GB00"})})]
+      (is (= (str "Your input fields are:\n"
+                  "1. `payment` (json object): How the customer paid\n"
+                  "   1. `kind` (str): Payment kind\n"
+                  "   2. `iban` (str): Bank account number")
+             guide))
+      (is (not (str/includes? guide "last4"))))))
+
+(deftest a-nested-entry-is-matched-by-the-keyword-or-by-its-json-spelling-test
+  (testing "a map already parsed from JSON with string keys: ns/name for a qualified keyword"
+    (let [value (json/parse-string (sent {:status "open" :opened-by "Bo" :billing/plan "pro" :closed-at nil}))
+          guide (sio/input-field-guide [billing-case] {:case value})]
+      (is (= {"status" "open" "opened-by" "Bo" "billing/plan" "pro" "closed-at" nil} value)
+          "precondition: string keys, as a JSON parser without keyword keys returns them")
+      (is (= (str "Your input fields are:\n"
+                  "1. `case` (json object): The case under review\n"
+                  "   1. `status` (one of: open, closed): Where the case stands\n"
+                  "   2. `opened-by` (str): Who opened the case\n"
+                  "   3. `billing/plan` (str): Subscription plan\n"
+                  "   4. `closed-at` (str or null, optional): When it was closed")
+             guide))
+      (is (not (str/includes? guide "owner")))))
+
+  (testing "a declared key that is itself a string, in a map and in JSON text"
+    (let [contract {:name :labels
+                    :spec [:map ["name" {:description "Display name"} :string]
+                           ["colour" {:optional true :description "Hex colour"} :string]]}
+          expected (str "Your input fields are:\n"
+                        "1. `labels` (json object)\n"
+                        "   1. `name` (str): Display name")]
+      (is (= expected (sio/input-field-guide [contract] {:labels {"name" "x"}})))
+      (is (= expected (sio/input-field-guide [contract] {:labels (sent {:name "x"})})))))
+
+  (testing "a union of records whose value has string keys"
+    (let [guide (sio/input-field-guide [payment-input]
+                                       {:payment (json/parse-string (sent {:iban "GB00" :reference "R-1"}))})]
+      (is (str/includes? guide "`iban` (str): Bank account number"))
+      (is (not (str/includes? guide "card-last4")))))
+
+  (testing "a dispatched union whose value has string keys"
+    (let [guide (sio/input-field-guide [dispatched-payment]
+                                       {:payment (json/parse-string (sent {:kind :transfer :iban "GB00"}))})]
+      (is (str/includes? guide "`iban` (str): Bank account number"))
+      (is (not (str/includes? guide "last4"))))))
+
+;; =============================================================================
+;; The interaction-format markers match the guide
+;; =============================================================================
+
+(deftest the-markers-of-a-request-name-only-the-inputs-it-shows-test
+  (let [spec {:inputs [{:name :subject :spec :string :description "The ticket subject line"}
+                       {:name :coupon-code :spec :string :optional true
+                        :description "Promo code the customer quoted"}
+                       {:name :photo :type :image :description "A photo of the damage"}
+                       {:name :history :spec [:vector :string] :optional true
+                        :description "Earlier messages"}]
+              :outputs [{:name :verdict :spec :string :description "The decision"}]
+              :instructions "Decide."}
+        prompt (sio/spec->prompt spec {:subject "Refund please" :photo "data:image/png;base64,abc"})]
+    (testing "precondition: the shown input is in the guide and has its marker"
+      (is (str/includes? prompt "`subject` (str): The ticket subject line"))
+      (is (str/includes? prompt "[[ ## subject ## ]]\n{subject}")))
+    (testing "the output markers are still there"
+      (is (str/includes? prompt "[[ ## verdict ## ]]\n{verdict}")))
+    (testing "an input the request does not carry is named nowhere in the prompt"
+      (is (not (str/includes? prompt "coupon-code")))
+      (is (not (str/includes? prompt "Promo code")))
+      (is (not (str/includes? prompt "history")))
+      (is (not (str/includes? prompt "Earlier messages"))))
+    (testing "an image input is still not in the text"
+      (is (not (str/includes? prompt "photo"))))
+    (testing "a request that carries every input names every input"
+      (let [full (sio/spec->prompt spec {:subject "s" :coupon-code "c" :history ["h"]})]
+        (doseq [shown ["[[ ## subject ## ]]" "[[ ## coupon-code ## ]]" "[[ ## history ## ]]"]]
+          (is (str/includes? full shown) shown))))
+    (testing "the one-argument form keeps naming every declared input"
+      (let [declared (sio/spec->prompt spec)]
+        (doseq [shown ["[[ ## subject ## ]]" "[[ ## coupon-code ## ]]" "[[ ## history ## ]]"]]
+          (is (str/includes? declared shown) shown))))))

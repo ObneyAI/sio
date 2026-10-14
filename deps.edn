@@ -9,14 +9,19 @@
 
  :aliases
  {:dev {:extra-paths ["dev" "test"]
-        :extra-deps {org.clojure/tools.namespace {:mvn/version "1.5.0"}}}
+        :extra-deps {org.clojure/tools.namespace {:mvn/version "1.5.0"}
+                     cheshire/cheshire {:mvn/version "5.13.0"}}}
 
+  ;; cheshire is test-only: the guide tests build complex input values as JSON
+  ;; text exactly as a caller that serializes them with cheshire does.
   :test {:extra-paths ["test"]
-         :extra-deps {lambdaisland/kaocha {:mvn/version "1.91.1392"}}
+         :extra-deps {lambdaisland/kaocha {:mvn/version "1.91.1392"}
+                      cheshire/cheshire {:mvn/version "5.13.0"}}
          :main-opts ["-m" "kaocha.runner"]}
 
   :nrepl {:extra-paths ["test"]
-          :extra-deps {nrepl/nrepl {:mvn/version "1.3.1"}}
+          :extra-deps {nrepl/nrepl {:mvn/version "1.3.1"}
+                       cheshire/cheshire {:mvn/version "5.13.0"}}
           :jvm-opts ["-Djdk.attach.allowAttachSelf"]
           :main-opts ["-m" "nrepl.cmdline" "--port" "7888"]}
 

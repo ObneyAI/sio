@@ -37,8 +37,10 @@
   and `parse-tool-call-response` reads the arguments back out."
   (:require [clojure.string :as str]
             [clojure.data.json :as json]
+            [clojure.walk :as walk]
             [malli.core :as m]
-            [malli.json-schema :as mjs]))
+            [malli.json-schema :as mjs]
+            [malli.transform :as mt]))
 
 ;; =============================================================================
 ;; Malli Schema Support
@@ -528,12 +530,37 @@
       :or (boolean (some carries-fields? children))
       false)))
 
+(defn- json-spelling
+  "How a JSON serializer writes a keyword: `name`, or `ns/name`. Anything else is
+  returned as it is."
+  [x]
+  (if (keyword? x) (subs (str x) 1) x))
+
+(defn- carried-key
+  "The key of map `m` that carries the declared key `k`: `k` itself, or its JSON
+  spelling, or the keyword of that spelling -- so a map parsed from JSON
+  (string keys) is read like one built in Clojure. nil when `m` carries none."
+  [m k]
+  (let [spelled (json-spelling k)]
+    (some #(when (contains? m %) %)
+          (cond-> [k spelled]
+            (string? spelled) (conj (keyword spelled))))))
+
 (defn- value-checker
-  "A predicate: does a value satisfy the schema `form`? A form Malli cannot
-  compile, or a value it cannot check, satisfies nothing."
+  "A predicate: does a value satisfy the schema `form`? The value is tried as it
+  is, and as it reads back from JSON: string keys as keywords, and a keyword
+  value as the string it was written as. A form Malli cannot compile, or a
+  value it cannot check, satisfies nothing."
   [form]
-  (let [valid? (try (m/validator form) (catch Exception _ (constantly false)))]
-    (fn [value] (try (boolean (valid? value)) (catch Exception _ false)))))
+  (let [[valid? decode] (try [(m/validator form) (m/decoder form (mt/json-transformer))]
+                             (catch Exception _ [(constantly false) identity]))]
+    (fn [value]
+      (try (let [keywordized (walk/keywordize-keys value)]
+             (boolean (or (valid? value)
+                          (valid? (decode value))
+                          (valid? keywordized)
+                          (valid? (decode keywordized)))))
+           (catch Exception _ false)))))
 
 (defn- fitting-branches
   "The branches of a union that some observed value satisfies, each paired with
@@ -557,11 +584,15 @@
   (if (all-shown? observed)
     (mapv (fn [entry] [(last entry) all-shown]) entries)
     (let [tags (set (map first entries))
+          ;; A tag matches the dispatch result as it is, or as JSON spells it.
+          tag-for (fn [result]
+                    (some #(when (or (= % result) (= (json-spelling %) (json-spelling result))) %)
+                          tags))
+          dispatch-result (fn [value] (try (dispatch value) (catch Exception _ ::none)))
           selected-tag (fn [value]
-                         (let [tag (try (dispatch value) (catch Exception _ ::none))]
-                           (cond
-                             (contains? tags tag) tag
-                             (contains? tags :malli.core/default) :malli.core/default)))
+                         (or (tag-for (dispatch-result value))
+                             (tag-for (dispatch-result (walk/keywordize-keys value)))
+                             (when (contains? tags :malli.core/default) :malli.core/default)))
           by-tag (group-by selected-tag (non-nil observed))]
       (into [] (keep (fn [entry]
                        (when-let [values (get by-tag (first entry))]
@@ -601,7 +632,7 @@
   observed map carries the key. A key present with a nil value is carried."
   [[k & more] observed]
   (let [maps (when-not (all-shown? observed) (filter map? observed))]
-    (when (or (all-shown? observed) (some #(contains? % k) maps))
+    (when (or (all-shown? observed) (some #(carried-key % k) maps))
       (let [[entry-props form] (if (map? (first more))
                                  [(first more) (second more)]
                                  [nil (first more)])]
@@ -611,7 +642,7 @@
                     form
                     (if (all-shown? observed)
                       all-shown
-                      (into [] (comp (filter #(contains? % k)) (map #(get % k))) maps)))))))
+                      (into [] (comp (filter #(carried-key % k)) (map #(get % (carried-key % k)))) maps)))))))
 
 (defn- items-of
   "The non-nil elements of every observed collection, as one vector, or
@@ -717,6 +748,21 @@
       (str indent n ". `" name "` (" type ")"
            (when meaning (str ": " meaning))))))
 
+(defn- as-sent
+  "The value of an input as the model was sent it, in the shape its schema
+  declares. A complex value reaches the model as JSON TEXT, so for a schema with
+  record fields to explain a string that is JSON is parsed back (keys to
+  keywords, `ns/name` to `:ns/name`, as `parse-output` reads them) and the
+  guide judges what is shown from the parsed value. A string that is not
+  JSON stays as it is: the input is shown, and nothing nested is."
+  [spec value]
+  (if (and (string? value)
+           (carries-fields? spec)
+           (re-find #"^\s*[\[{]" value))
+    (try (json/read-str value :key-fn keyword)
+         (catch Exception _ value))
+    value))
+
 (defn- render-input-guide
   "The input field guide for every non-image field of `inputs` that `values`
   shows, or nil when there is none. `values` is a map keyed by input name, or
@@ -729,7 +775,7 @@
                             optional
                             (or (meaning-text description) (own-meaning spec))
                             spec
-                            (if (all-shown? values) all-shown [(get values name)])))]
+                            (if (all-shown? values) all-shown [(as-sent spec (get values name))])))]
     (when (seq nodes)
       (str "Your input fields are:\n"
            (str/join "\n" (map line-text (with-references (flatten-nodes (vec nodes) 0 []))))))))
@@ -855,7 +901,8 @@
   ([spec]
    (render-prompt spec (render-input-guide (:inputs spec) all-shown)))
   ([spec input-values]
-   (render-prompt spec (input-field-guide (:inputs spec) input-values))))
+   (render-prompt (update spec :inputs #(filterv (fn [input] (contains? input-values (:name input))) %))
+                  (input-field-guide (:inputs spec) input-values))))
 
 (defn build-message-content
   "Build message content for an LLM call, supporting multimodal inputs.
