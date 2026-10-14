@@ -698,3 +698,111 @@
       (let [lines (str/split-lines guide)
             field-lines (filter #(re-find #"^ *\d+\. `s\d+-f\d+`" %) lines)]
         (is (= (count shown-fields) (count field-lines)))))))
+
+;; =============================================================================
+;; Added after a first round of mutations left gaps: unions inside unions, a nil
+;; under a nullable union, the type of a collection of unions, references into
+;; collection items, and values/forms the guide must survive.
+;; =============================================================================
+
+(deftest a-union-nested-in-a-union-narrows-its-type-too-test
+  (let [contract {:name :payment
+                  :spec [:or
+                         [:or
+                          [:map [:card-last4 {:description "Last four digits"} :string]]
+                          [:map [:iban {:description "Bank account number"} :string]]]
+                         :int]}
+        guide (sio/input-field-guide [contract] {:payment {:iban "GB00"}})]
+    (is (= (str "Your input fields are:\n"
+                "1. `payment` (json object)\n"
+                "   1. `iban` (str): Bank account number")
+           guide))
+    (is (not (str/includes? guide "card-last4")))))
+
+(deftest a-nil-value-selects-no-branch-of-a-union-test
+  (testing "the field is shown with its declared type; no branch is claimed present"
+    (let [contract {:name :payment
+                    :spec [:maybe [:or
+                                   [:maybe [:map [:iban {:description "Bank account number"} :string]]]
+                                   :string]]}
+          guide (sio/input-field-guide [contract] {:payment nil})]
+      (is (= (str "Your input fields are:\n"
+                  "1. `payment` (json object or null or str, or null)")
+             guide)))))
+
+(deftest a-collection-of-unions-types-itself-by-the-branches-its-items-take-test
+  (let [contract {:name :payments :spec [:vector (:spec payment-input)]}]
+    (is (str/includes?
+         (sio/input-field-guide [contract] {:payments [{:iban "A" :reference "1"} {:iban "B" :reference "2"}]})
+         "1. `payments` (json array of json object)\n"))
+    (testing "nullable collection of unions"
+      (is (str/includes?
+           (sio/input-field-guide [{:name :payments :spec [:maybe [:vector (:spec payment-input)]]}]
+                                  {:payments [{:iban "A" :reference "1"}]})
+           "1. `payments` (json array of json object or null)\n")))
+    (testing "a map-of whose values are unions"
+      (is (str/includes?
+           (sio/input-field-guide [{:name :by-id :spec [:map-of :string (:spec payment-input)]}]
+                                  {:by-id {"a" {:iban "A" :reference "1"}}})
+           "1. `by-id` (json object with str keys and json object values)\n")))))
+
+(deftest a-reference-into-collection-items-names-the-place-test
+  (let [inputs [{:name :messages
+                 :spec [:vector [:map [:author-kind {:description staff-meaning} :string]]]}
+                {:name :drafts
+                 :spec [:vector [:map [:author-kind {:description staff-meaning} :string]]]}]
+        guide (sio/input-field-guide inputs {:messages [{:author-kind "human"}]
+                                             :drafts [{:author-kind "human"}]})]
+    (is (= (str "Your input fields are:\n"
+                "1. `messages` (json array of json object)\n"
+                "   each item:\n"
+                "      1. `author-kind` (str): " staff-meaning "\n"
+                "2. `drafts` (json array of json object)\n"
+                "   each item:\n"
+                "      1. `author-kind` (str): (same meaning as `messages[].author-kind`)")
+           guide))))
+
+(deftest a-meaning-on-the-items-themselves-is-written-once-too-test
+  (let [inputs [{:name :a :spec [:vector [:map {:description "One entry"} [:x {:description "X"} :string]]]}
+                {:name :b :spec [:vector [:map {:description "One entry"} [:y {:description "Y"} :string]]]}]
+        guide (sio/input-field-guide inputs {:a [{:x "1"}] :b [{:y "2"}]})]
+    (is (= 1 (occurrences guide "One entry")))
+    (is (str/includes? guide "each item: (same meaning as `a[]`)"))))
+
+(deftest the-guide-survives-forms-and-values-it-cannot-judge-test
+  (testing "a union branch Malli cannot compile fits nothing, and nothing throws"
+    (let [contract {:name :x :description "A union"
+                    :spec [:or [:map [:a {:description "A"} [:ref :no/such-schema]]]
+                           [:map [:b {:description "B"} :string]]]}]
+      (is (str/includes? (sio/input-field-guide [contract] {:x {:b "1"}}) "`b` (str): B"))
+      (is (string? (sio/input-field-guide [contract] {:x {:a 1}})))))
+  (testing "a dispatch that throws selects no branch, and nothing throws"
+    (let [boom (fn [_] (throw (ex-info "boom" {})))]
+      (is (= (str "Your input fields are:\n"
+                  "1. `x` (json object): A dispatched union")
+             (sio/input-field-guide
+              [{:name :x :description "A dispatched union"
+                :spec [:multi {:dispatch boom} [:p [:map [:v {:description "V"} :string]]]]}]
+              {:x {:v "1"}})))))
+  (testing "a dispatch that is not callable selects no branch, and nothing throws"
+    (is (string? (sio/input-field-guide
+                  [{:name :x :spec [:multi {:dispatch [:not :callable]}
+                                    [:p [:map [:v {:description "V"} :string]]]]}]
+                  {:x {:v "1"}}))))
+  (testing "a description that is not text is no meaning, and nothing throws"
+    (is (= (str "Your input fields are:\n"
+                "1. `x` (str)\n"
+                "2. `y` (json object)\n"
+                "   1. `z` (str)")
+           (sio/input-field-guide
+            [{:name :x :spec :string :description :not-text}
+             {:name :y :spec [:map [:z {:description 42} :string]] :description nil}]
+            {:x "1" :y {:z "2"}}))))
+  (testing "a multi branch tagged :malli.core/default is selected when no other tag is"
+    (let [contract {:name :x
+                    :spec [:multi {:dispatch :k}
+                           [:a [:map [:a-only {:description "A only"} :string]]]
+                           [:malli.core/default [:map [:other {:description "Other"} :string]]]]}
+          guide (sio/input-field-guide [contract] {:x {:k :zzz :other "1"}})]
+      (is (str/includes? guide "`other` (str): Other"))
+      (is (not (str/includes? guide "a-only"))))))
