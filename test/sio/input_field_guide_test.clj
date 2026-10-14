@@ -1193,3 +1193,22 @@
     (is (str/starts-with? (sio/input-field-guide [contract] {:x deep})
                           "Your input fields are:\n1. `x`"))
     (is (str/includes? (sio/input-field-guide [contract] {:x {:b "1"}}) "`b` (str): B"))))
+
+(deftest the-guide-and-the-markers-always-name-the-same-inputs-test
+  (let [spec {:inputs [{:name :a :spec :string :description "Meaning of a"}
+                       {:name :b :spec [:maybe :string] :optional true :description "Meaning of b"}
+                       {:name :c :spec [:map [:x {:description "Meaning of x"} :string]] :description "Meaning of c"}
+                       {:name :photo :type :image}]
+              :outputs [{:name :out :spec :string}]}
+        in-guide (fn [prompt] (set (map (comp keyword second) (re-seq #"(?m)^\d+\. `([^`]+)`" (input-section prompt)))))
+        in-markers (fn [prompt] (set (map (comp keyword second)
+                                          (re-seq #"\[\[ ## (a|b|c|photo) ## \]\]" prompt))))]
+    (doseq [[values shown] [[{} #{}]
+                            [{:a "x"} #{:a}]
+                            [{:b nil} #{:b}]
+                            [{:a "" :c ""} #{:a :c}]
+                            [{:c (sent {:x "1"})} #{:c}]
+                            [{:a "x" :b "y" :c {:x "1"} :photo "data:image/png;base64,abc"} #{:a :b :c}]]]
+      (let [prompt (sio/spec->prompt spec values)]
+        (is (= shown (in-guide prompt)) (str "guide for " (pr-str values)))
+        (is (= shown (in-markers prompt)) (str "markers for " (pr-str values)))))))
