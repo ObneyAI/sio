@@ -830,3 +830,25 @@
                          [:schema {:registry {:t/boom boom}} :t/boom]
                          [:map [:b {:description "B"} :string]]]}]
     (is (str/includes? (sio/input-field-guide [contract] {:x {:b "1"}}) "`b` (str): B"))))
+
+(deftest a-leaf-is-typed-exactly-as-the-existing-type-rendering-types-it-test
+  (testing "for every leaf shape the guide writes what spec->type-str writes"
+    (doseq [spec [:string :int :double :float :boolean 'string? 'int?
+                  [:maybe :string] [:or :int :double] [:maybe [:or :int :double]]
+                  [:or :boolean :string] [:or [:vector :string] :string]
+                  [:enum "a" "b"] [:enum :a :b] [:enum {:min 1} "a" "b"]
+                  [:maybe [:enum "a" "b"]] [:vector :string] [:vector [:enum "a" "b"]]
+                  [:set :int] [:tuple :string :int] [:string {:min 1}] :map :vector]]
+      (let [guide (sio/input-field-guide [{:name :f :spec spec}] {:f nil})]
+        (is (= (str "Your input fields are:\n1. `f` (" (sio/spec->type-str spec) ")") guide)
+            (pr-str spec))))))
+
+(deftest a-description-is-written-trimmed-and-a-blank-one-is-no-meaning-test
+  (let [guide (sio/input-field-guide
+               [{:name :padded :spec :string :description "  Padded.\n"}
+                {:name :blank :spec :string :description "  \n "}]
+               {:padded "x" :blank "y"})]
+    (is (= (str "Your input fields are:\n"
+                "1. `padded` (str): Padded.\n"
+                "2. `blank` (str)")
+           guide))))
