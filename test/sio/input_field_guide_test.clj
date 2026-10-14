@@ -1148,3 +1148,48 @@
             guide (explained contract {"kind" "transfer" "iban" "GB00"})]
         (is (has? guide "`iban` (str): Bank account"))
         (is (not (has? guide "last4")))))))
+
+(deftest string-keyed-values-are-read-at-every-depth-test
+  (let [contract {:name :account
+                  :description "The customer account"
+                  :spec [:map
+                         [:profile {:description "Who they are"}
+                          [:map [:contact {:description "How to reach them"}
+                                 [:map [:phone {:description "Mobile number"} :string]
+                                  [:fax {:optional true :description "Fax number"} :string]]]]]
+                         [:orders {:description "Past orders"}
+                          [:vector [:map [:sku {:description "Stock code"} :string]
+                                    [:gift/note {:optional true :description "Gift message"} :string]
+                                    [:coupon {:optional true :description "Promo code"} :string]]]]]}
+        value (json/parse-string
+               (sent {:profile {:contact {:phone "0123"}}
+                      :orders [{:sku "A-1"} {:sku "B-2" :gift/note "Happy birthday"}]}))
+        guide (sio/input-field-guide [contract] {:account value})]
+    (is (= (str "Your input fields are:\n"
+                "1. `account` (json object): The customer account\n"
+                "   1. `profile` (json object): Who they are\n"
+                "      1. `contact` (json object): How to reach them\n"
+                "         1. `phone` (str): Mobile number\n"
+                "   2. `orders` (json array of json object): Past orders\n"
+                "      each item:\n"
+                "         1. `sku` (str): Stock code\n"
+                "         2. `gift/note` (str, optional): Gift message")
+           guide))
+    (testing "absent at depth leaves no trace"
+      (is (not (str/includes? guide "fax")))
+      (is (not (str/includes? guide "coupon"))))
+    (testing "the same text, parsed by the guide itself, reads identically"
+      (is (= guide (sio/input-field-guide
+                    [contract]
+                    {:account (sent {:profile {:contact {:phone "0123"}}
+                                     :orders [{:sku "A-1"} {:sku "B-2" :gift/note "Happy birthday"}]})}))))))
+
+(deftest a-recursive-schema-over-a-value-too-deep-to-check-fits-nothing-test
+  (let [deep (reduce (fn [acc _] [acc]) [] (range 50000))
+        contract {:name :x
+                  :spec [:or
+                         [:schema {:registry {:t/tree [:or :int [:vector [:ref :t/tree]]]}} :t/tree]
+                         [:map [:b {:description "B"} :string]]]}]
+    (is (str/starts-with? (sio/input-field-guide [contract] {:x deep})
+                          "Your input fields are:\n1. `x`"))
+    (is (str/includes? (sio/input-field-guide [contract] {:x {:b "1"}}) "`b` (str): B"))))
