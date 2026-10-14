@@ -852,3 +852,18 @@
                 "1. `padded` (str): Padded.\n"
                 "2. `blank` (str)")
            guide))))
+
+(deftest without-values-dispatched-unions-and-maps-of-are-shown-too-test
+  (let [section (input-section
+                 (sio/spec->prompt
+                  {:inputs [dispatched-payment
+                            {:name :scores
+                             :spec [:map-of :string
+                                    [:map [:value {:description "0 to 10"} :int]]]}]
+                   :outputs [{:name :verdict :spec :string}]}))]
+    (testing "every branch of a dispatched union"
+      (is (str/includes? section "`last4` (str): Last four digits of the card"))
+      (is (str/includes? section "`iban` (str): Bank account number")))
+    (testing "the value fields of a map-of"
+      (is (str/includes? section "each value:"))
+      (is (str/includes? section "`value` (int): 0 to 10")))))
