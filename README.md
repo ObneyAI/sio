@@ -176,6 +176,54 @@ the enum is caught before it reaches your router:
 Now `(:priority result)` and `(:needs-human result)` are values you can `case` on
 with confidence — no regexing the model's prose, no guessing.
 
+## The input field guide
+
+`spec->prompt` opens with an **input field guide**: for each input field the
+model is shown, its name, its type and its declared meaning. The guide is public,
+so a caller that builds its own request can place the same account anywhere:
+
+```clojure
+(def support
+  {:inputs  [{:name :subject  :spec :string :description "The ticket subject line"}
+             {:name :nickname :spec :string :optional true
+              :description "What the customer likes to be called"}
+             {:name :coupon   :spec :string :optional true
+              :description "Promo code the customer quoted"}
+             {:name :photo    :type :image :description "A photo of the damage"}]
+   :outputs [{:name :reply :spec :string :description "The reply to send"}]})
+
+(sio/input-field-guide (:inputs support) {:subject "Refund please" :nickname "Al"})
+;; =>
+;; Your input fields are:
+;; 1. `subject` (str): The ticket subject line
+;; 2. `nickname` (str, optional): What the customer likes to be called
+```
+
+The rules:
+
+- **Shown fields only.** An input is shown when `input-values` carries it. `coupon`
+  is absent here, so it is neither explained nor listed; an input present with a
+  `nil` value is shown. The model cannot see a value that is not in the request.
+- **The name is the declared name.** Optionality is stated beside the type,
+  `(str, optional)`, never on the name.
+- **No description, no meaning.** An undescribed input is listed by name and type.
+- **Images are excluded.** An image input stays a content part (see
+  `build-message-content`).
+
+`spec->prompt` takes the request's values as a second argument, and its input
+section *is* the guide:
+
+```clojure
+(sio/spec->prompt support {:subject "Refund please" :nickname "Al"})
+;; => the guide above, then the output section, the interaction-format
+;;    markers and the instructions, exactly as before
+```
+
+`(sio/spec->prompt support)`, without values, keeps working: with no request to
+read, **every declared input is treated as shown**, so the section is a complete
+account of the contract. The output section, the markers and the instruction
+section are the same for both forms.
+
 ## Nested data & forgiving parsing
 
 The triage above used enums, a vector, a bounded double, and a boolean. Fields can
@@ -273,7 +321,8 @@ All public vars live in `sio.core`:
 
 | Function | Purpose |
 |---|---|
-| `spec->prompt` | Render a spec into a prompt template |
+| `spec->prompt` | Render a spec into a prompt template (`[spec]`, or `[spec input-values]` to explain only the inputs a request carries) |
+| `input-field-guide` | Render the input field guide: name, type and meaning of each input a request shows |
 | `build-message-content` | Inject inputs; produce string or multimodal content parts |
 | `parse-output` | Parse a model's text response into typed data |
 | `parse-streaming-output` | Progressive `parse-output` over accumulated text |

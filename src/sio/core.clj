@@ -449,32 +449,59 @@
 ;; Prompt Rendering
 ;; =============================================================================
 
-(defn spec->prompt
-  "Render a spec (I/O contract) into a prompt template.
+(defn- render-input-guide
+  "The input field guide for every non-image field of `inputs` that `shown?`
+  accepts, or nil when there is none."
+  [inputs shown?]
+  (let [fields (->> inputs
+                    (remove #(= :image (:type %)))
+                    (filter shown?))]
+    (when (seq fields)
+      (str "Your input fields are:\n"
+           (str/join "\n"
+                     (map-indexed
+                      (fn [idx {:keys [name spec description optional]}]
+                        (str (inc idx) ". `" (clojure.core/name name) "` ("
+                             (spec->type-str spec) (when optional ", optional") ")"
+                             (when-not (str/blank? description) (str ": " description))))
+                      fields))))))
 
-  A spec is a map with:
-  - :inputs - Vector of field definitions with :name, :spec, :description keys
-  - :outputs - Vector of field definitions with :name, :spec, :description keys
-  - :instructions - Optional string describing the task instructions, rules, and examples
+(defn input-field-guide
+  "Render the input field guide: the account, for one request, of each input
+  field the model is shown -- its name, its type and its declared meaning.
 
-  The rendered prompt uses DSPy-style field markers ([[ ## field ## ]]) and
-  emits per-type notes (booleans, enums, JSON) for the output fields. Image
-  inputs (:type :image) are omitted from the text template — send them as
-  content parts via `build-message-content`.
+  Parameters:
+  - inputs: the contract's declared input fields (maps with :name, :spec,
+            :description, :optional, :type)
+  - input-values: this request's values, keyed by input name
 
-  Returns a formatted prompt string."
-  [spec]
+  Returns the text block that opens a prompt's input section, beginning
+  \"Your input fields are:\", or nil when the request shows no text input.
+
+  One numbered line per SHOWN top-level input, in declared order:
+
+      1. `name` (type): meaning
+
+  - Shown means present in `input-values`. An input the request does not carry
+    is neither explained nor listed; an input present with a nil value is shown.
+  - The name is exactly the declared name. Optionality is stated in the type
+    parenthesis, `(str, optional)`, never on the name.
+  - The type is `spec->type-str`.
+  - An input with no description is listed by name and type, with no meaning.
+  - Image inputs (:type :image) are never listed: they stay content parts."
+  [inputs input-values]
+  (render-input-guide inputs #(contains? input-values (:name %))))
+
+(defn- render-prompt
+  "Render a spec into a prompt whose input section is `input-section` (the input
+  field guide, or nil), followed by the output section, the interaction-format
+  markers and the instruction section."
+  [spec input-section]
   (let [{:keys [inputs outputs instructions]} spec
         format-field (fn [idx {:keys [name spec description optional]}]
                        (let [type-str (spec->type-str spec)]
                          (str (inc idx) ". `" (clojure.core/name name) "` (" type-str
                               (when optional ", optional") "): " description)))
-
-        ;; Input fields section (exclude image inputs — they're sent as content parts, not text)
-        text-inputs (remove #(= :image (:type %)) inputs)
-        input-section (when (seq text-inputs)
-                        (str "Your input fields are:\n"
-                             (str/join "\n" (map-indexed format-field text-inputs))))
 
         ;; Output fields section
         output-section (when (seq outputs)
@@ -514,6 +541,35 @@
         ;; Combine all sections
         sections (filter some? [input-section output-section interaction-format instructions-section])]
     (str/join "\n" sections)))
+
+(defn spec->prompt
+  "Render a spec (I/O contract) into a prompt template.
+
+  A spec is a map with:
+  - :inputs - Vector of field definitions with :name, :spec, :description keys
+  - :outputs - Vector of field definitions with :name, :spec, :description keys
+  - :instructions - Optional string describing the task instructions, rules, and examples
+
+  The rendered prompt uses DSPy-style field markers ([[ ## field ## ]]) and
+  emits per-type notes (booleans, enums, JSON) for the output fields. Image
+  inputs (:type :image) are omitted from the text template — send them as
+  content parts via `build-message-content`.
+
+  The input section is the input field guide (see `input-field-guide`).
+
+  - `(spec->prompt spec input-values)` -- the guide explains the inputs this
+    request carries, per `input-values`, and no others.
+  - `(spec->prompt spec)` -- without the request's values every declared input
+    is treated as shown, so the section is a complete account of the contract.
+
+  The output section, interaction-format markers and instruction section are
+  the same for both arities.
+
+  Returns a formatted prompt string."
+  ([spec]
+   (render-prompt spec (render-input-guide (:inputs spec) (constantly true))))
+  ([spec input-values]
+   (render-prompt spec (input-field-guide (:inputs spec) input-values))))
 
 (defn build-message-content
   "Build message content for an LLM call, supporting multimodal inputs.
