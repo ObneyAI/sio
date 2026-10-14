@@ -449,22 +449,290 @@
 ;; Prompt Rendering
 ;; =============================================================================
 
+;; ---------------------------------------------------------------------------
+;; The input field guide
+;;
+;; Two passes. The first walks each shown input's schema, alongside the values
+;; the request carries, and builds a tree of NODES -- one per shown field, each
+;; with its type, its meaning and its shown children. The second flattens the
+;; tree to lines and writes them.
+;; ---------------------------------------------------------------------------
+
+(def ^:private all-shown
+  "Stands in for the values a position carries when there are none to read:
+  every declared field there is then shown."
+  ::all-shown)
+
+(defn- all-shown? [observed]
+  (= all-shown observed))
+
+(defn- non-nil
+  "The observed values that are not nil, or `all-shown`."
+  [observed]
+  (if (all-shown? observed) observed (filterv some? observed)))
+
+(defn- schema-parts
+  "Split a Malli schema FORM into {:type :props :children}. A form that is not a
+  vector (a bare keyword, a symbol) has no type, properties or children."
+  [form]
+  (if (and (vector? form) (keyword? (first form)))
+    (let [[schema-type & more] form
+          [props children] (if (map? (first more))
+                             [(first more) (rest more)]
+                             [nil more])]
+      {:type schema-type :props props :children (vec children)})
+    {:type nil :props nil :children []}))
+
+(defn- meaning-text
+  "A declared description as the guide writes it: trimmed, or nil if there is none."
+  [description]
+  (when (string? description)
+    (let [text (str/trim description)]
+      (when-not (str/blank? text) text))))
+
+(defn- own-meaning
+  "The description a schema carries in its own properties, looking through the
+  `:maybe` wrappers that only add nullability."
+  [form]
+  (let [{:keys [type props children]} (schema-parts form)]
+    (or (meaning-text (:description props))
+        (when (= :maybe type) (own-meaning (first children))))))
+
+(defn- guide-type-str
+  "The type the guide writes beside a field. A map is `json object` and a
+  collection is `json array of` its item type: the fields of a record follow
+  beneath it, only those the request shows, so they are not repeated in the
+  type. Every other type is `spec->type-str`."
+  [form]
+  (let [{:keys [type children]} (schema-parts form)]
+    (case type
+      (:map :multi) "json object"
+      (:vector :sequential) (str "json array of " (guide-type-str (first children)))
+      :map-of (str "json object with " (guide-type-str (first children)) " keys and "
+                   (guide-type-str (second children)) " values")
+      ;; A union's comma keeps the null an alternative to the WHOLE union.
+      :maybe (let [child (first children)]
+               (str (guide-type-str child)
+                    (if (= :or (:type (schema-parts child))) ", or null" " or null")))
+      :or (str/join " or " (map guide-type-str children))
+      (spec->type-str form))))
+
+(defn- carries-fields?
+  "Does a schema have record fields to explain somewhere inside it?"
+  [form]
+  (let [{:keys [type children]} (schema-parts form)]
+    (case type
+      (:map :multi) true
+      (:maybe :vector :sequential :set) (carries-fields? (first children))
+      :map-of (carries-fields? (second children))
+      :or (boolean (some carries-fields? children))
+      false)))
+
+(defn- value-checker
+  "A predicate: does a value satisfy the schema `form`? A form Malli cannot
+  compile, or a value it cannot check, satisfies nothing."
+  [form]
+  (let [valid? (try (m/validator form) (catch Exception _ (constantly false)))]
+    (fn [value] (try (boolean (valid? value)) (catch Exception _ false)))))
+
+(defn- fitting-branches
+  "The branches of a union that some observed value satisfies, each paired with
+  just the values that satisfy it: [[branch values] ...]. A nil value satisfies
+  no branch. Under `all-shown` every branch fits."
+  [branches observed]
+  (if (all-shown? observed)
+    (mapv (fn [branch] [branch all-shown]) branches)
+    (let [values (non-nil observed)]
+      (into [] (keep (fn [branch]
+                       (let [fits (filterv (value-checker branch) values)]
+                         (when (seq fits) [branch fits]))))
+            branches))))
+
+(defn- selected-multi-branches
+  "The branches of a `:multi` schema that the observed values select, each paired
+  with just the values that select it: [[branch values] ...]. A value selects
+  the branch tagged with its dispatch result, else the `:malli.core/default`
+  branch. `entries` are the `[tag schema]` or `[tag props schema]` branches."
+  [{:keys [dispatch]} entries observed]
+  (if (all-shown? observed)
+    (mapv (fn [entry] [(last entry) all-shown]) entries)
+    (let [tags (set (map first entries))
+          selected-tag (fn [value]
+                         (let [tag (try (dispatch value) (catch Exception _ ::none))]
+                           (cond
+                             (contains? tags tag) tag
+                             (contains? tags :malli.core/default) :malli.core/default)))
+          by-tag (group-by selected-tag (non-nil observed))]
+      (into [] (keep (fn [entry]
+                       (when-let [values (get by-tag (first entry))]
+                         [(last entry) values])))
+            entries))))
+
+(declare items-of values-of)
+
+(defn- narrow-type
+  "The schema whose type the guide writes for a field: the same schema, except
+  that a union of records keeps only the branches the request's values fit."
+  [form observed]
+  (let [{:keys [type children]} (schema-parts form)]
+    (case type
+      :maybe [:maybe (narrow-type (first children) (non-nil observed))]
+      (:vector :sequential) [type (narrow-type (first children) (items-of observed))]
+      :map-of [:map-of (first children) (narrow-type (second children) (values-of observed))]
+      :or (if-let [fits (and (some carries-fields? children)
+                             (seq (fitting-branches children observed)))]
+            (into [:or] (map (fn [[branch values]] (narrow-type branch values))) fits)
+            form)
+      form)))
+
+(declare expand-children)
+
+(defn- field-node
+  "A guide node for one shown field. `observed` is every value the request
+  carries at this position (a vector), or `all-shown`."
+  [field-name optional? meaning form observed]
+  {:name field-name
+   :type (str (guide-type-str (narrow-type form observed)) (when optional? ", optional"))
+   :meaning meaning
+   :children (expand-children form observed)})
+
+(defn- entry-node
+  "The node for one entry `[key props? schema]` of a map schema, or nil when no
+  observed map carries the key. A key present with a nil value is carried."
+  [[k & more] observed]
+  (let [maps (when-not (all-shown? observed) (filter map? observed))]
+    (when (or (all-shown? observed) (some #(contains? % k) maps))
+      (let [[entry-props form] (if (map? (first more))
+                                 [(first more) (second more)]
+                                 [nil (first more)])]
+        (field-node (if (keyword? k) (subs (str k) 1) (str k))
+                    (:optional entry-props)
+                    (or (meaning-text (:description entry-props)) (own-meaning form))
+                    form
+                    (if (all-shown? observed)
+                      all-shown
+                      (into [] (comp (filter #(contains? % k)) (map #(get % k))) maps)))))))
+
+(defn- items-of
+  "The non-nil elements of every observed collection, as one vector, or
+  `all-shown`."
+  [observed]
+  (if (all-shown? observed)
+    all-shown
+    (into [] (comp (filter #(or (sequential? %) (set? %))) cat (filter some?)) observed)))
+
+(defn- values-of
+  "The non-nil values of every observed map, as one vector, or `all-shown`."
+  [observed]
+  (if (all-shown? observed)
+    all-shown
+    (into [] (comp (filter map?) (mapcat vals) (filter some?)) observed)))
+
+(defn- each-nodes
+  "A one-element vector holding the `each` node that explains the items of a
+  collection -- once, whatever their number -- or [] when the request shows no
+  item or the item has nothing to explain. `label` introduces the line; `token`
+  marks the item in a field's path."
+  [label token item-form items]
+  (if (or (all-shown? items) (seq items))
+    (let [children (expand-children item-form items)
+          meaning (own-meaning item-form)]
+      (if (or (seq children) meaning)
+        [{:each label :token token :meaning meaning :children children}]
+        []))
+    []))
+
+(defn- expand-children
+  "The nodes beneath a field of schema `form`: the shown fields of a map, or the
+  `each item:` node of a collection."
+  [form observed]
+  (let [{:keys [type props children]} (schema-parts form)]
+    (case type
+      :map (into [] (keep #(entry-node % observed)) (filter vector? children))
+      :maybe (expand-children (first children) (non-nil observed))
+      :or (into [] (mapcat (fn [[branch values]] (expand-children branch values)))
+                (fitting-branches children observed))
+      :multi (into [] (mapcat (fn [[branch values]] (expand-children branch values)))
+                   (selected-multi-branches props children observed))
+      (:vector :sequential :set) (each-nodes "each item:" "[]" (first children) (items-of observed))
+      :map-of (each-nodes "each value:" "{}" (second children) (values-of observed))
+      [])))
+
+(defn- flatten-nodes
+  "Pre-order lines for `nodes`, each {:depth :n :node :path}. Fields are numbered
+  per parent; an `each` node is not numbered. A line's path is the names of the
+  fields above it and its own, an item written `name[]`."
+  [nodes depth parent-path]
+  (first
+   (reduce (fn [[lines n] node]
+             (let [n (if (:each node) n (inc n))
+                   path (if (:each node)
+                          (conj (pop parent-path) (str (peek parent-path) (:token node)))
+                          (conj parent-path (:name node)))]
+               [(into (conj lines {:depth depth :n n :node node :path path})
+                      (flatten-nodes (:children node) (inc depth) path))
+                n]))
+           [[] 0]
+           nodes)))
+
+(defn- with-references
+  "Write each distinct meaning once. A later line whose meaning an earlier line
+  already wrote says `(same meaning as `place`)` instead, where `place` is the
+  earlier line's field name -- or its full path when that name labels more than
+  one line, so the reference can only mean one."
+  [lines]
+  (let [name-counts (frequencies (map (comp peek :path) lines))
+        place (fn [{:keys [path]}]
+                (if (> (name-counts (peek path)) 1)
+                  (str/join "." path)
+                  (peek path)))]
+    (:lines
+     (reduce (fn [{:keys [seen] :as acc} {:keys [node] :as line}]
+               (let [meaning (:meaning node)]
+                 (cond
+                   (nil? meaning)
+                   (update acc :lines conj line)
+
+                   (contains? seen meaning)
+                   (update acc :lines conj
+                           (assoc-in line [:node :meaning]
+                                     (str "(same meaning as `" (get seen meaning) "`)")))
+
+                   :else
+                   (-> acc
+                       (assoc-in [:seen meaning] (place line))
+                       (update :lines conj line)))))
+             {:seen {} :lines []}
+             lines))))
+
+(defn- line-text
+  "One guide line. A meaning that runs over several lines keeps its continuation
+  lines under the field that owns them (blank lines stay empty)."
+  [{:keys [depth n node]}]
+  (let [{:keys [name type meaning each]} node
+        indent (apply str (repeat depth "   "))
+        meaning (some-> meaning (str/replace #"\n(?=[^\n])" (str "\n" indent)))]
+    (if each
+      (str indent each (when meaning (str " " meaning)))
+      (str indent n ". `" name "` (" type ")"
+           (when meaning (str ": " meaning))))))
+
 (defn- render-input-guide
-  "The input field guide for every non-image field of `inputs` that `shown?`
-  accepts, or nil when there is none."
-  [inputs shown?]
-  (let [fields (->> inputs
-                    (remove #(= :image (:type %)))
-                    (filter shown?))]
-    (when (seq fields)
+  "The input field guide for every non-image field of `inputs` that `values`
+  shows, or nil when there is none. `values` is a map keyed by input name, or
+  `all-shown`."
+  [inputs values]
+  (let [nodes (for [{:keys [name spec description optional type]} inputs
+                    :when (and (not= :image type)
+                               (or (all-shown? values) (contains? values name)))]
+                (field-node (clojure.core/name name)
+                            optional
+                            (or (meaning-text description) (own-meaning spec))
+                            spec
+                            (if (all-shown? values) all-shown [(get values name)])))]
+    (when (seq nodes)
       (str "Your input fields are:\n"
-           (str/join "\n"
-                     (map-indexed
-                      (fn [idx {:keys [name spec description optional]}]
-                        (str (inc idx) ". `" (clojure.core/name name) "` ("
-                             (spec->type-str spec) (when optional ", optional") ")"
-                             (when-not (str/blank? description) (str ": " description))))
-                      fields))))))
+           (str/join "\n" (map line-text (with-references (flatten-nodes (vec nodes) 0 []))))))))
 
 (defn input-field-guide
   "Render the input field guide: the account, for one request, of each input
@@ -478,19 +746,37 @@
   Returns the text block that opens a prompt's input section, beginning
   \"Your input fields are:\", or nil when the request shows no text input.
 
-  One numbered line per SHOWN top-level input, in declared order:
+  One numbered line per SHOWN field, in declared order:
 
       1. `name` (type): meaning
 
-  - Shown means present in `input-values`. An input the request does not carry
-    is neither explained nor listed; an input present with a nil value is shown.
+  Shown means present in the request's values, at any depth:
+  - An input the request does not carry is neither explained nor listed. A field
+    present with a nil value is shown. An absent nested field is neither
+    explained nor listed anywhere, and a union explains only the branch the
+    values are in.
+  - Beneath a map input, its shown nested fields, indented one level per depth,
+    in the same line shape. For a collection of records (a vector, sequence or
+    set, or the values of a map-of) one `each item:` (`each value:`) line, then
+    the union of the fields present across its items, once -- however many items
+    there are.
+
+  The line:
   - The name is exactly the declared name. Optionality is stated in the type
     parenthesis, `(str, optional)`, never on the name.
-  - The type is `spec->type-str`.
-  - An input with no description is listed by name and type, with no meaning.
-  - Image inputs (:type :image) are never listed: they stay content parts."
+  - The type is `spec->type-str` for a leaf (so an enum's allowed values stay
+    visible). A map is `json object` and a collection `json array of ...`: the
+    fields beneath them are the shown ones, not every declared one.
+  - The meaning is the field's :description, else the :description of its
+    schema (or, nested, of its map entry). A field with none is listed by name
+    and type only.
+  - Each distinct meaning is written once. A later field with the same meaning
+    says `(same meaning as `first-field-name`)`; where that name labels more
+    than one line it is the dotted path, e.g. `buyer.role`.
+
+  Image inputs (:type :image) are never listed: they stay content parts."
   [inputs input-values]
-  (render-input-guide inputs #(contains? input-values (:name %))))
+  (render-input-guide inputs input-values))
 
 (defn- render-prompt
   "Render a spec into a prompt whose input section is `input-section` (the input
@@ -567,7 +853,7 @@
 
   Returns a formatted prompt string."
   ([spec]
-   (render-prompt spec (render-input-guide (:inputs spec) (constantly true))))
+   (render-prompt spec (render-input-guide (:inputs spec) all-shown)))
   ([spec input-values]
    (render-prompt spec (input-field-guide (:inputs spec) input-values))))
 

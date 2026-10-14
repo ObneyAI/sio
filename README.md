@@ -185,28 +185,59 @@ so a caller that builds its own request can place the same account anywhere:
 ```clojure
 (def support
   {:inputs  [{:name :subject  :spec :string :description "The ticket subject line"}
-             {:name :nickname :spec :string :optional true
-              :description "What the customer likes to be called"}
              {:name :coupon   :spec :string :optional true
               :description "Promo code the customer quoted"}
-             {:name :photo    :type :image :description "A photo of the damage"}]
+             {:name :photo    :type :image :description "A photo of the damage"}
+             {:name :account
+              :description "The customer account"
+              :spec [:map
+                     [:tier {:description "Support tier"} [:enum "free" "pro"]]
+                     [:region {:optional true :description "Where they are based"} :string]]}
+             {:name :messages
+              :description "The conversation so far, oldest first"
+              :spec [:vector
+                     [:map {:description "One message"}
+                      [:author-kind {:description "human means a staff member, never the customer's own words"}
+                       [:enum "human" "customer"]]
+                      [:text    {:description "What was written"} :string]
+                      [:sent-at {:optional true :description "When it was sent"} :string]]]}]
    :outputs [{:name :reply :spec :string :description "The reply to send"}]})
 
-(sio/input-field-guide (:inputs support) {:subject "Refund please" :nickname "Al"})
+(sio/input-field-guide
+  (:inputs support)
+  {:subject  "Refund please"
+   :account  {:tier "pro"}
+   :messages [{:author-kind "human"    :text "How can I help?"}
+              {:author-kind "customer" :text "I was charged twice" :sent-at "2026-01-02"}]})
 ;; =>
 ;; Your input fields are:
 ;; 1. `subject` (str): The ticket subject line
-;; 2. `nickname` (str, optional): What the customer likes to be called
+;; 2. `account` (json object): The customer account
+;;    1. `tier` (one of: free, pro): Support tier
+;; 3. `messages` (json array of json object): The conversation so far, oldest first
+;;    each item: One message
+;;       1. `author-kind` (one of: human, customer): human means a staff member, never the customer's own words
+;;       2. `text` (str): What was written
+;;       3. `sent-at` (str, optional): When it was sent
 ```
 
-The rules:
+The guide explains what the model is **shown**, and nothing else:
 
-- **Shown fields only.** An input is shown when `input-values` carries it. `coupon`
-  is absent here, so it is neither explained nor listed; an input present with a
-  `nil` value is shown. The model cannot see a value that is not in the request.
+- **Shown fields only.** A field is shown when the request's values carry it, at
+  any depth. `coupon` and `account`'s `region` are absent here, so they are
+  neither explained nor listed; a field present with a `nil` value is shown. A
+  union explains only the branch the values are in.
+- **A collection's item fields are explained once.** Two messages, or two
+  hundred, give one `each item:` line and the union of the fields the items
+  carry (`sent-at` appears because one message has it).
+- **Each meaning is written once.** A later field with the same description says
+  `(same meaning as `first-field-name`)` — or the dotted path, `buyer.role`,
+  where that name labels more than one line.
 - **The name is the declared name.** Optionality is stated beside the type,
   `(str, optional)`, never on the name.
-- **No description, no meaning.** An undescribed input is listed by name and type.
+- **No description, no meaning.** An undescribed field is listed by name and
+  type. A meaning is read from the field's `:description`, else the
+  `:description` in its schema (or, nested, its map entry).
 - **Images are excluded.** An image input stays a content part (see
   `build-message-content`).
 
@@ -214,15 +245,15 @@ The rules:
 section *is* the guide:
 
 ```clojure
-(sio/spec->prompt support {:subject "Refund please" :nickname "Al"})
-;; => the guide above, then the output section, the interaction-format
-;;    markers and the instructions, exactly as before
+(sio/spec->prompt support {:subject "Refund please" :account {:tier "pro"}})
+;; => the guide, then the output section, the interaction-format markers and the
+;;    instructions
 ```
 
 `(sio/spec->prompt support)`, without values, keeps working: with no request to
-read, **every declared input is treated as shown**, so the section is a complete
-account of the contract. The output section, the markers and the instruction
-section are the same for both forms.
+read, **every declared field is treated as shown**, at every depth, so the
+section is a complete account of the contract. The output section, the markers
+and the instruction section are the same for both forms.
 
 ## Nested data & forgiving parsing
 
