@@ -6,6 +6,7 @@
    public interface, never how the renderer walks a schema."
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
+            [malli.core :as m]
             [sio.core :as sio]))
 
 (deftest top-level-meaning-that-lives-only-in-a-description-reaches-the-guide-test
@@ -806,3 +807,26 @@
           guide (sio/input-field-guide [contract] {:x {:k :zzz :other "1"}})]
       (is (str/includes? guide "`other` (str): Other"))
       (is (not (str/includes? guide "a-only"))))))
+
+(deftest a-collection-of-nothing-has-no-item-to-explain-test
+  (let [records [:map {:description "One entry"} [:x {:description "X"} :string]]]
+    (testing "items that are nil carry no fields and are not an item to describe"
+      (is (= (str "Your input fields are:\n"
+                  "1. `a` (json array of json object)")
+             (sio/input-field-guide [{:name :a :spec [:vector records]}] {:a [nil nil]}))))
+    (testing "values that are nil carry no fields and are not a value to describe"
+      (is (= (str "Your input fields are:\n"
+                  "1. `b` (json object with str keys and json object values)")
+             (sio/input-field-guide [{:name :b :spec [:map-of :string records]}] {:b {"k" nil}}))))
+    (testing "precondition: the same contract does describe a real item"
+      (is (str/includes?
+           (sio/input-field-guide [{:name :a :spec [:vector records]}] {:a [nil {:x "1"}]})
+           "each item: One entry")))))
+
+(deftest a-schema-whose-validator-throws-fits-nothing-and-nothing-escapes-test
+  (let [boom (m/-simple-schema {:type :t/boom :pred (fn [_] (throw (ex-info "boom" {})))})
+        contract {:name :x
+                  :spec [:or
+                         [:schema {:registry {:t/boom boom}} :t/boom]
+                         [:map [:b {:description "B"} :string]]]}]
+    (is (str/includes? (sio/input-field-guide [contract] {:x {:b "1"}}) "`b` (str): B"))))

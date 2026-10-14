@@ -576,7 +576,7 @@
   [form observed]
   (let [{:keys [type children]} (schema-parts form)]
     (case type
-      :maybe [:maybe (narrow-type (first children) (non-nil observed))]
+      :maybe [:maybe (narrow-type (first children) observed)]
       (:vector :sequential) [type (narrow-type (first children) (items-of observed))]
       :map-of [:map-of (first children) (narrow-type (second children) (values-of observed))]
       :or (if-let [fits (and (some carries-fields? children)
@@ -649,7 +649,7 @@
   (let [{:keys [type props children]} (schema-parts form)]
     (case type
       :map (into [] (keep #(entry-node % observed)) (filter vector? children))
-      :maybe (expand-children (first children) (non-nil observed))
+      :maybe (expand-children (first children) observed)
       :or (into [] (mapcat (fn [[branch values]] (expand-children branch values)))
                 (fitting-branches children observed))
       :multi (into [] (mapcat (fn [[branch values]] (expand-children branch values)))
