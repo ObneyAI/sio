@@ -1075,3 +1075,76 @@
       (let [declared (sio/spec->prompt spec)]
         (doseq [shown ["[[ ## subject ## ]]" "[[ ## coupon-code ## ]]" "[[ ## history ## ]]"]]
           (is (str/includes? declared shown) shown))))))
+
+(deftest text-nested-too-deep-to-parse-is-shown-with-nothing-nested-test
+  (let [nested (fn [depth] (str (apply str (repeat depth "[")) (apply str (repeat depth "]"))))
+        shown-only (str "Your input fields are:\n"
+                        "1. `case` (json object): The case under review")]
+    (testing "a JSON parser overflows its stack long before this depth"
+      (is (= shown-only (sio/input-field-guide [billing-case] {:case (nested 100000)}))))
+    (testing "a value nested too deep to walk is shown, and nothing escapes"
+      (let [deep (reduce (fn [acc _] [acc]) [] (range 50000))
+            value {"iban" "GB00" "reference" "R" "extra" deep}]
+        (is (str/starts-with? (sio/input-field-guide [payment-input] {:payment value})
+                              "Your input fields are:\n1. `payment`"))
+        (is (str/starts-with? (sio/input-field-guide [dispatched-payment] {:payment {"kind" "transfer" "extra" deep}})
+                              "Your input fields are:\n1. `payment`"))))
+    (testing "deep but parseable text is read, and a union of records is still judged"
+      (let [deep (str "{\"iban\":\"GB00\",\"reference\":\"R\",\"x\":" (nested 1500) "}")
+            guide (sio/input-field-guide [payment-input] {:payment deep})]
+        (is (str/includes? guide "`iban` (str): Bank account number"))
+        (is (not (str/includes? guide "card-last4")))))))
+
+(deftest only-text-that-is-a-json-object-or-array-is-read-as-json-test
+  (let [contract {:name :answer
+                  :description "Either free text or a record"
+                  :spec [:or :string [:map [:code {:description "Error code"} :string]]]}]
+    (testing "a text that merely looks like a JSON scalar is the string branch, not parsed"
+      (doseq [text ["123" "null" "true" "\"quoted\""]]
+        (is (= (str "Your input fields are:\n1. `answer` (str): Either free text or a record")
+               (sio/input-field-guide [contract] {:answer text}))
+            text)))
+    (testing "a JSON object is the record branch, and its fields are explained"
+      (is (= (str "Your input fields are:\n"
+                  "1. `answer` (json object): Either free text or a record\n"
+                  "   1. `code` (str): Error code")
+             (sio/input-field-guide [contract] {:answer (sent {:code "E1"})}))))
+    (testing "leading whitespace before the JSON is allowed"
+      (is (str/includes? (sio/input-field-guide [contract] {:answer (str "\n  " (sent {:code "E1"}))})
+                         "`code` (str): Error code")))))
+
+(deftest a-union-is-judged-whichever-way-its-keys-and-values-are-spelled-test
+  (let [explained (fn [contract value]
+                    (sio/input-field-guide [contract] {:x value}))
+        has? (fn [guide s] (str/includes? guide s))]
+    (testing "string-declared keys, string-keyed value (raw as it is)"
+      (let [contract {:name :x :spec [:or [:map ["iban" {:description "Bank account"} :string]]
+                                      [:map ["last4" {:description "Card digits"} :string]]]}
+            guide (explained contract {"iban" "GB00"})]
+        (is (has? guide "`iban` (str): Bank account"))
+        (is (not (has? guide "last4")))))
+    (testing "string-declared keys with a keyword literal: the value reads back as a string"
+      (let [contract {:name :x :spec [:or [:map ["kind" [:= :card]] ["last4" {:description "Card digits"} :string]]
+                                      [:map ["kind" [:= :transfer]] ["iban" {:description "Bank account"} :string]]]}
+            guide (explained contract {"kind" "transfer" "iban" "GB00"})]
+        (is (has? guide "`iban` (str): Bank account"))
+        (is (not (has? guide "last4")))))
+    (testing "keyword-declared keys with a keyword literal, string-keyed value"
+      (let [contract {:name :x :spec [:or [:map [:kind [:= :card]] [:last4 {:description "Card digits"} :string]]
+                                      [:map [:kind [:= :transfer]] [:iban {:description "Bank account"} :string]]]}
+            guide (explained contract (json/parse-string (sent {:kind :transfer :iban "GB00"})))]
+        (is (has? guide "`iban` (str): Bank account"))
+        (is (not (has? guide "last4")))))
+    (testing "keyword-declared keys with a keyword literal, keyword-keyed value that already holds the keyword"
+      (let [contract {:name :x :spec [:or [:map [:kind [:= :card]] [:last4 {:description "Card digits"} :string]]
+                                      [:map [:kind [:= :transfer]] [:iban {:description "Bank account"} :string]]]}
+            guide (explained contract {:kind :transfer :iban "GB00"})]
+        (is (has? guide "`iban` (str): Bank account"))
+        (is (not (has? guide "last4")))))
+    (testing "a dispatch function that reads a string key, and a tag spelled as a string"
+      (let [contract {:name :x :spec [:multi {:dispatch #(get % "kind")}
+                                      ["card" [:map ["last4" {:description "Card digits"} :string]]]
+                                      ["transfer" [:map ["iban" {:description "Bank account"} :string]]]]}
+            guide (explained contract {"kind" "transfer" "iban" "GB00"})]
+        (is (has? guide "`iban` (str): Bank account"))
+        (is (not (has? guide "last4")))))))

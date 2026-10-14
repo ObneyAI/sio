@@ -546,6 +546,16 @@
           (cond-> [k spelled]
             (string? spelled) (conj (keyword spelled))))))
 
+(defn- keywordized
+  "A value whose map keys are strings (a map parsed from JSON without keyword
+  keys) with its keys as keywords. A value that does not need it, or that is
+  nested too deep to walk, is returned as it is."
+  [value]
+  (if (and (map? value) (some string? (keys value)))
+    (try (walk/keywordize-keys value)
+         (catch StackOverflowError _ value))
+    value))
+
 (defn- value-checker
   "A predicate: does a value satisfy the schema `form`? The value is tried as it
   is, and as it reads back from JSON: string keys as keywords, and a keyword
@@ -555,11 +565,12 @@
   (let [[valid? decode] (try [(m/validator form) (m/decoder form (mt/json-transformer))]
                              (catch Exception _ [(constantly false) identity]))]
     (fn [value]
-      (try (let [keywordized (walk/keywordize-keys value)]
+      (try (let [keyed (keywordized value)]
              (boolean (or (valid? value)
                           (valid? (decode value))
-                          (valid? keywordized)
-                          (valid? (decode keywordized)))))
+                          (valid? keyed)
+                          (valid? (decode keyed)))))
+           (catch StackOverflowError _ false)
            (catch Exception _ false)))))
 
 (defn- fitting-branches
@@ -591,7 +602,7 @@
           dispatch-result (fn [value] (try (dispatch value) (catch Exception _ ::none)))
           selected-tag (fn [value]
                          (or (tag-for (dispatch-result value))
-                             (tag-for (dispatch-result (walk/keywordize-keys value)))
+                             (tag-for (dispatch-result (keywordized value)))
                              (when (contains? tags :malli.core/default) :malli.core/default)))
           by-tag (group-by selected-tag (non-nil observed))]
       (into [] (keep (fn [entry]
@@ -760,6 +771,8 @@
            (carries-fields? spec)
            (re-find #"^\s*[\[{]" value))
     (try (json/read-str value :key-fn keyword)
+         ;; Text nested deeper than the parser's stack is not JSON the guide can read.
+         (catch StackOverflowError _ value)
          (catch Exception _ value))
     value))
 
