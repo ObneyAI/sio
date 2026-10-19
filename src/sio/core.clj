@@ -123,7 +123,7 @@
     ;; Maybe - nullable. A union child gets a comma before the null so the null
     ;; reads as an alternative to the WHOLE union, not to its last branch.
     (and (vector? spec) (= :maybe (first spec)))
-    (let [child (second spec)
+    (let [child (if (map? (second spec)) (nth spec 2) (second spec))
           child-str (spec->type-str child)]
       (if (and (vector? child) (= :or (first child)))
         (str child-str ", or null")
@@ -238,6 +238,19 @@
             value))
         ;; Not JSON, return as-is
         value))))
+
+(defn- parse-nullable-json-value
+  "Decode a complete JSON value, including scalars, for the nullable JSON
+  protocol. Invalid/incomplete input stays visible for contract validation."
+  [value]
+  (try
+    ;; data.json 2.5.0's number reader needs a trailing separator for its
+    ;; extra-data check; the callback must still reject non-whitespace suffixes.
+    (json/read-str (str (strip-markdown-code-block value) "\n")
+                   :key-fn keyword
+                   :extra-data-fn (fn [parsed reader]
+                                    (if (str/blank? (slurp reader)) parsed value)))
+    (catch Exception _ value)))
 
 (defn- vector-output-spec?
   "True when a schema requires a vector, allowing for Malli properties and a
@@ -428,7 +441,7 @@
         ;; scalar through unwrapped and only one of the two parse paths is safe.
         (when parsed
           (into {}
-                (keep (fn [{:keys [name spec optional]}]
+                (keep (fn [{:keys [name spec]}]
                         (let [keyword-name (keyword (clojure.core/name name))
                               string-name (clojure.core/name name)
                               present? (or (contains? parsed keyword-name)
@@ -441,10 +454,7 @@
                                              (not (vector? value)))
                                       [value]
                                       value)]
-                          (cond
-                            present? [name value]
-                            optional nil
-                            :else [name nil])))
+                          (when present? [name value])))
                 outputs)))))))
 
 ;; =============================================================================
@@ -1065,7 +1075,7 @@
   For complex specs (maps, vectors), parses JSON responses; ints/floats are
   coerced from their string form; enums stay plain strings.
 
-  A declared field with no readable value is nil. In particular a BOOLEAN whose
+  A missing marker is absent from the returned map. A present BOOLEAN whose
   value is neither a true- nor a false-spelling is nil rather than `false`: a
   fabricated `false` is a valid value and would be indistinguishable from an
   answer. See the marker-block contract above for what counts as a block.
@@ -1100,7 +1110,9 @@
 
                             ;; Complex specs - parse as JSON
                             (complex-spec? spec)
-                            (let [parsed-value (parse-json-value value)]
+                            (let [parsed-value (if (= :maybe (m/type (m/schema spec)))
+                                                 (parse-nullable-json-value value)
+                                                 (parse-json-value value))]
                               ;; Models commonly omit JSON array brackets for a
                               ;; singleton. Preserve the schema's cardinality
                               ;; instead of leaking a scalar through parse-output.
@@ -1124,12 +1136,10 @@
 
                             :else value)))
         parsed (into {}
-                     (keep (fn [{:keys [name spec optional]}]
+                     (keep (fn [{:keys [name spec]}]
                              (let [raw-value (extract-field name response)]
-                               (cond
-                                 (some? raw-value) [name (convert-value raw-value spec)]
-                                 optional nil
-                                 :else [name nil]))))
+                               (when (some? raw-value)
+                                 [name (convert-value raw-value spec)]))))
                      outputs)]
     ;; Single-field fallback: models answering a one-output-field spec
     ;; often write plain prose and skip the field markers entirely —
@@ -1149,7 +1159,7 @@
                (contains? #{:string 'string? nil} single-base)
                (every? nil? (vals parsed))
                (string? response)
-               (not (str/blank? response)))
+               (not (str/blank? (strip-completion-marker response))))
         {(:name single) (-> response str/trim strip-completion-marker)}
         parsed))))
 
@@ -1236,8 +1246,11 @@
   - accumulated-text: The accumulated response text so far
   - spec: The spec with :outputs
 
-  Returns parsed output, which may be partial/incomplete. This is just
-  `parse-output` applied to the text accumulated so far — pair it with your own
-  streaming loop (e.g. over a stream of provider chunks)."
+  Returns parsed output, which may be partial/incomplete. Missing required fields
+  retain nil placeholders for progressive consumers; optional fields stay absent.
+  Call `parse-output` for the final result before required-field validation."
   [accumulated-text spec]
-  (parse-output accumulated-text spec))
+  (merge (into {} (keep (fn [{:keys [name optional]}]
+                         (when-not optional [name nil])))
+               (:outputs spec))
+         (parse-output accumulated-text spec)))

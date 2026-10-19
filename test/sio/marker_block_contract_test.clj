@@ -226,10 +226,10 @@
     "[[ ## rows ## ]]\n[{\"k\": 1}]\n\n[[ ## note ## ]]\nn\n"
     {:outputs [{:name :rows :spec [:vector [:map [:k :int]]]} {:name :note :spec :string}]}
     {:rows [{:k 1}] :note "n"}]
-   ["maybe string still yields the string \"null\" (D4, untouched here)"
+   ["nullable string decodes JSON null"
     "[[ ## maybe_v ## ]]\nnull\n\n[[ ## note ## ]]\nn\n"
     {:outputs [{:name :maybe_v :spec [:maybe :string]} {:name :note :spec :string}]}
-    {:maybe_v "null" :note "n"}]
+    {:maybe_v nil :note "n"}]
    ["completed marker is stripped"
     "[[ ## answer ## ]]\nParis\n\n[[ ## reason ## ]]\ncapital\n\n[[ ## completed ## ]]\n"
     {:outputs [{:name :answer :spec :string} {:name :reason :spec :string}]}
@@ -254,31 +254,26 @@
     "Paris.\n[[ ## completed ## ]]\ntrailing"
     {:outputs [{:name :answer :spec :string}]}
     {:answer "Paris.\n[[ ## completed ## ]]\ntrailing"}]
-   ["missing field is nil"
+   ["missing field is absent"
     "[[ ## answer ## ]]\nParis\n"
     {:outputs [{:name :answer :spec :string} {:name :absent :spec :string}]}
-    {:answer "Paris" :absent nil}]
+    {:answer "Paris"}]
    ["snake_case and kebab-case names"
     "[[ ## snake_name ## ]]\ns\n\n[[ ## kebab-name ## ]]\nk\n"
     {:outputs [{:name :snake_name :spec :string} {:name :kebab-name :spec :string}]}
     {:snake_name "s" :kebab-name "k"}]
-   ["streaming, partial"
+   ["partial text through final parser omits missing fields"
     "[[ ## a ## ]]\npar"
     {:outputs [{:name :a :spec :string} {:name :b :spec :string}]}
-    {:a "par" :b nil}]
+    {:a "par"}]
    ["empty response"
     ""
     {:outputs [{:name :a :spec :string} {:name :b :spec :string}]}
-    {:a nil :b nil}]])
+    {}]])
 
-(deftest a-nil-response-is-nil-fields-not-a-nullpointerexception-test
-  ;; Disclosed micro-change that rides with the extraction rewrite. A provider
-  ;; can return a nil message content, and previously that threw NPE out of
-  ;; `parse-output` — an unclassified exception that loses the usage, the model
-  ;; and the field-level detail a caller needs. Nothing was read, so every
-  ;; declared field is nil: the same shape as any other unreadable response.
-  (testing "no content at all is every declared field nil"
-    (is (= {:a nil :b nil} (sio/parse-output nil two-strings)))))
+(deftest a-nil-response-preserves-absence-test
+  (testing "no content means no fields, not fabricated nullable answers"
+    (is (= {} (sio/parse-output nil two-strings)))))
 
 (deftest well-formed-responses-parse-unchanged-test
   (doseq [[label response spec expected] well-formed-corpus]

@@ -154,12 +154,12 @@
            (sio/parse-output "[[ ## answer ## ]]\nHi."
                              {:outputs [{:name :answer :spec :string}]}))))
   (testing "multi-field specs stay strict"
-    (is (= {:a nil :b nil}
+    (is (= {}
            (sio/parse-output "plain text"
                              {:outputs [{:name :a :spec :string}
                                         {:name :b :spec :string}]}))))
   (testing "non-string single fields stay strict"
-    (is (= {:flag nil}
+    (is (= {}
            (sio/parse-output "plain text"
                              {:outputs [{:name :flag :spec :boolean}]})))))
 
@@ -1302,7 +1302,7 @@
     (let [spec {:outputs [{:name (keyword "a.c") :spec :string}
                           {:name :sentinel :spec :string}]}
           response "[[ ## abc ## ]]\nWRONG-FIELDS-VALUE\n\n[[ ## sentinel ## ]]\ns\n"]
-      (is (= {(keyword "a.c") nil :sentinel "s"} (sio/parse-output response spec)))))
+      (is (= {:sentinel "s"} (sio/parse-output response spec)))))
 
   (testing "an invalid-as-a-regex name does not blow up the parse"
     (let [spec {:outputs [{:name (keyword "*x*") :spec :string}
@@ -1367,10 +1367,10 @@
               {:outputs [{:name :rows :spec [:vector [:map [:k :int]]]}
                          {:name :note :spec :string}]}
               {:rows [{:k 1}] :note "n"}]
-             ["[:maybe :string] keeps today's \"null\" string"
+             ["nullable string decodes JSON null"
               "[[ ## maybe_v ## ]]\nnull\n\n[[ ## note ## ]]\nn\n"
               {:outputs [{:name :maybe_v :spec [:maybe :string]} {:name :note :spec :string}]}
-              {:maybe_v "null" :note "n"}]
+              {:maybe_v nil :note "n"}]
              ["the completed marker is stripped"
               "[[ ## answer ## ]]\nParis\n\n[[ ## reason ## ]]\ncapital\n\n[[ ## completed ## ]]\n"
               {:outputs [{:name :answer :spec :string} {:name :reason :spec :string}]}
@@ -1391,10 +1391,10 @@
               "Paris is the capital of France."
               {:outputs [{:name :answer :spec :string}]}
               {:answer "Paris is the capital of France."}]
-             ["a declared field with no marker is nil"
+             ["a declared field with no marker is absent"
               "[[ ## answer ## ]]\nParis\n"
               {:outputs [{:name :answer :spec :string} {:name :absent :spec :string}]}
-              {:answer "Paris" :absent nil}]
+              {:answer "Paris"}]
              ["snake_case and kebab-case names"
               "[[ ## snake_name ## ]]\ns\n\n[[ ## kebab-name ## ]]\nk\n"
               {:outputs [{:name :snake_name :spec :string} {:name :kebab-name :spec :string}]}
@@ -1402,5 +1402,5 @@
              ["empty response"
               ""
               {:outputs [{:name :a :spec :string} {:name :b :spec :string}]}
-              {:a nil :b nil}]]]
+              {}]]]
       (is (= expected (sio/parse-output response spec)) label))))
