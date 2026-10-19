@@ -176,6 +176,93 @@ the enum is caught before it reaches your router:
 Now `(:priority result)` and `(:needs-human result)` are values you can `case` on
 with confidence — no regexing the model's prose, no guessing.
 
+## The input field guide
+
+`spec->prompt` opens with an **input field guide**: for each input field the
+model is shown, its name, its type and its declared meaning. The guide is public,
+so a caller that builds its own request can place the same account anywhere:
+
+```clojure
+(def support
+  {:inputs  [{:name :subject  :spec :string :description "The ticket subject line"}
+             {:name :coupon   :spec :string :optional true
+              :description "Promo code the customer quoted"}
+             {:name :photo    :type :image :description "A photo of the damage"}
+             {:name :account
+              :description "The customer account"
+              :spec [:map
+                     [:tier {:description "Support tier"} [:enum "free" "pro"]]
+                     [:region {:optional true :description "Where they are based"} :string]]}
+             {:name :messages
+              :description "The conversation so far, oldest first"
+              :spec [:vector
+                     [:map {:description "One message"}
+                      [:author-kind {:description "human means a staff member, never the customer's own words"}
+                       [:enum "human" "customer"]]
+                      [:text    {:description "What was written"} :string]
+                      [:sent-at {:optional true :description "When it was sent"} :string]]]}]
+   :outputs [{:name :reply :spec :string :description "The reply to send"}]})
+
+(sio/input-field-guide
+  (:inputs support)
+  {:subject  "Refund please"
+   :account  {:tier "pro"}
+   :messages [{:author-kind "human"    :text "How can I help?"}
+              {:author-kind "customer" :text "I was charged twice" :sent-at "2026-01-02"}]})
+;; =>
+;; Your input fields are:
+;; 1. `subject` (str): The ticket subject line
+;; 2. `account` (json object): The customer account
+;;    1. `tier` (one of: free, pro): Support tier
+;; 3. `messages` (json array of json object): The conversation so far, oldest first
+;;    each item: One message
+;;       1. `author-kind` (one of: human, customer): human means a staff member, never the customer's own words
+;;       2. `text` (str): What was written
+;;       3. `sent-at` (str, optional): When it was sent
+```
+
+The guide explains what the model is **shown**, and nothing else:
+
+- **Shown fields only.** A field is shown when the request's values carry it, at
+  any depth. `coupon` and `account`'s `region` are absent here, so they are
+  neither explained nor listed; a field present with a `nil` value is shown. A
+  union explains only the branch the values are in.
+- **Values may be JSON text.** A caller often sends a complex input as JSON text.
+  For an input with record fields to explain, a string that is a JSON object or
+  array is read as that value: a nested entry is matched by its declared key or
+  its JSON spelling (`name`, `ns/name`), and a JSON `null` is a field present
+  with no value, so it is shown. Text that is not JSON leaves the input shown
+  with nothing nested.
+- **A collection's item fields are explained once.** Two messages, or two
+  hundred, give one `each item:` line and the union of the fields the items
+  carry (`sent-at` appears because one message has it).
+- **Each meaning is written once.** A later field with the same description says
+  `(same meaning as `first-field-name`)` — or the dotted path, `buyer.role`,
+  where that name labels more than one line.
+- **The name is the declared name.** Optionality is stated beside the type,
+  `(str, optional)`, never on the name.
+- **No description, no meaning.** An undescribed field is listed by name and
+  type. A meaning is read from the field's `:description`, else the
+  `:description` in its schema (or, nested, its map entry).
+- **Images are excluded.** An image input stays a content part (see
+  `build-message-content`).
+
+`spec->prompt` takes the request's values as a second argument. Its input
+section *is* the guide, and its interaction-format markers name only the inputs
+the request carries, so an input the model cannot see is named nowhere:
+
+```clojure
+(sio/spec->prompt support {:subject "Refund please" :account {:tier "pro"}})
+;; => the guide, then the output section, the interaction-format markers (for
+;;    `subject` and `account` only) and the instructions
+```
+
+`(sio/spec->prompt support)`, without values, keeps working: with no request to
+read, **every declared input is treated as shown**, at every depth, so the
+section is a complete account of the contract and the markers name every input.
+The output section, the output markers and the instruction section are the same
+for both forms.
+
 ## Nested data & forgiving parsing
 
 The triage above used enums, a vector, a bounded double, and a boolean. Fields can
@@ -273,7 +360,8 @@ All public vars live in `sio.core`:
 
 | Function | Purpose |
 |---|---|
-| `spec->prompt` | Render a spec into a prompt template |
+| `spec->prompt` | Render a spec into a prompt template (`[spec]`, or `[spec input-values]` to explain only the inputs a request carries) |
+| `input-field-guide` | Render the input field guide: name, type and meaning of each input a request shows |
 | `build-message-content` | Inject inputs; produce string or multimodal content parts |
 | `parse-output` | Parse a model's text response into typed data |
 | `parse-streaming-output` | Progressive `parse-output` over accumulated text |

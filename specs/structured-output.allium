@@ -1,0 +1,58 @@
+-- allium: 3
+-- Focused repair contract; provider and workflow ownership remain external.
+external entity StructuredCaller {}
+contract StructuredOutputIntegrity {
+    parse_tool: (specification: Any, response: Any) -> Any
+    parse_markers: (specification: Any, response: String) -> Any
+    describe: (schema: Any) -> String
+    compile_json_output: (specification: Any) -> Any
+    describe_json_output: (compiled_contract: Any) -> String
+    parse_json_output: (compiled_contract: Any, response: String) -> Any
+    @invariant PresenceIsIndependentOfNullability
+        -- A missing output stays absent. An explicitly supplied null stays present
+        -- for a required nullable output. Validation rejects absent required fields
+        -- and rejects present values disallowed by their schema. Optional outputs
+        -- retain existing absence normalization without losing declared nullable values.
+    @invariant DescriptionMatchesContract
+        -- Descriptions distinguish whether a value may be null from whether its
+        -- field may be absent. Literal field names and declared meanings survive.
+    @invariant OptionalStringValueIsDecodedOnce
+        -- JSON-encoded optional string values in marker responses decode to the
+        -- authored string, preserving actual quote characters within that value.
+        -- Existing plain-string, structured and streaming conventions remain intact.
+    @invariant StrictContractPreservesMeaning
+        -- Strict JSON output compilation derives a closed output envelope from
+        -- declared fields, preserving literal names, descriptions and supported
+        -- constraints. Numeric wire bounds come from authored schema properties;
+        -- the compiler does not invent machine integer extrema as provider
+        -- constraints. Exact host representability remains validated during decoding.
+        -- Enum choices may carry per-option meanings alongside other output fields.
+        -- Supported option-description metadata remains model-visible, including
+        -- nested choices and choices with an outer field or entry description.
+        -- Descriptions do not change the allowed values or paired decoding.
+        -- Enum ordered-band metadata, when present, is boolean. True marks
+        -- the declared choices as ordered bands; their order and meanings remain
+        -- visible in the compiled contract and its guide. False is ordinary enum
+        -- annotation. Neither changes membership or paired decoding; malformed
+        -- annotation is rejected rather than silently discarded.
+        -- Malformed option metadata and unknown constraint properties fail explicitly.
+        -- Object properties retain the authored output order at every size; this
+        -- is request fidelity, not a guarantee about hidden model reasoning.
+        -- Required nullable values remain present. Optional non-null
+        -- values use a nullable wire sentinel paired with absence decoding.
+        -- Ambiguous optional-nullable fields, open nested objects, dynamic maps
+        -- and unsupported schema shapes fail explicitly before provider dispatch;
+        -- compilation never silently narrows or drops a constraint.
+        -- The same compiled contract supplies model-visible output guidance;
+        -- field meanings are not confined to an external decoding constraint.
+    @invariant StrictResponseIsComplete
+        -- A strict response is exactly one complete JSON object with all required
+        -- wire fields and no undeclared properties. Trailing data, malformed JSON,
+        -- invalid values and missing fields fail. Parsing uses the same compiled
+        -- contract that produced the request and validates the original meanings.
+}
+surface StructuredOutputBoundary {
+    facing caller: StructuredCaller
+    contracts:
+        fulfils StructuredOutputIntegrity
+}
