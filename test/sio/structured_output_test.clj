@@ -157,14 +157,13 @@
     (is (= {:answer nil} (structured/parse-output compiled " \n{\"answer\":null}\t\n")))))
 
 (deftest ambiguous-and-unsupported-contracts-fail-before-dispatch
-  (doseq [outputs [[{:name :answer :spec [:maybe :string] :optional true}]
+  (doseq [outputs [[{:name :answer :spec [:or [:maybe :string] :string] :optional true}]
                    [{:name :answer :spec [:map [:a :string]]}]
-                   [{:name :answer :spec [:map-of :string :string]}]
                    [{:name :answer :spec :any}]
-                   [{:name :answer :spec [:or :string :int]}]
+                   [{:name :answer :spec [:or :int :double]}]
                    [{:name :answer :spec [:string {:json-schema/type "integer"}]}]
                    [{:name :same :spec :string} {:name "same" :spec :string}]
-                   [{:name :answer :spec [:map {:closed true} [:x {:optional true} [:maybe :int]]]}]]]
+                   [{:name :answer :spec [:map {:closed true} [:x {:optional true} [:or [:maybe :int] :int]]]}]]]
     (is (= :unsupported-output-schema
            (:failure-kind (rejection #(structured/compile-contract {:outputs outputs})))) (pr-str outputs))))
 
@@ -273,3 +272,20 @@
     (is (= names (vec (keys (get-in schema [:properties "nested" :properties])))))
     (is (ordered? serialized))
     (is (ordered? guide))))
+
+(deftest supported-dictionary-contract-keeps-literal-values-and-refuses-duplicate-keys
+  ;; The paired dictionary feature supersedes the old unsupported-schema row.
+  ;; Keep the other ambiguity/constraint rejection cases in their original test.
+  (let [compiled (structured/compile-contract
+                   {:outputs [{:name :answer :spec [:map-of :string [:maybe :string]]}]})]
+    (is (= "array" (get-in compiled [:schema :properties "answer" :type])))
+    (is (= {:answer {}} (structured/parse-output compiled "{\"answer\":[]}")))
+    (is (= {:answer {"literal" "{\"x\":true}" "empty" "" "absent-value" nil}}
+           (structured/parse-output compiled
+             "{\"answer\":[{\"key\":\"literal\",\"value\":\"{\\\"x\\\":true}\"},{\"key\":\"empty\",\"value\":\"\"},{\"key\":\"absent-value\",\"value\":null}]}")))
+    (is (= :duplicate-map-key
+           (:reason (rejection #(structured/parse-output compiled
+                                 "{\"answer\":[{\"key\":\"a\",\"value\":\"first\"},{\"key\":\"a\",\"value\":\"second\"}]}")))))
+    (is (= :schema-validation-failed
+           (:failure-kind (rejection #(structured/parse-output compiled
+                                       "{\"answer\":[{\"key\":\"a\",\"value\":42}]}")))))))
