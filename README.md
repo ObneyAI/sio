@@ -241,15 +241,19 @@ The guide explains what the model is **shown**, and nothing else:
   where that name labels more than one line.
 - **The name is the declared name.** Optionality is stated beside the type,
   `(str, optional)`, never on the name.
-- **No description, no meaning.** An undescribed field is listed by name and
-  type. A meaning is read from the field's `:description`, else the
-  `:description` in its schema (or, nested, its map entry).
+- **Declared meanings retain their roles.** An undescribed field is listed by
+  name and type. Distinct field or map-entry and schema descriptions both
+  appear, labeled `Field meaning`, `Entry meaning` and `Schema meaning` as
+  applicable. Identical descriptions appear once.
 - **Images are excluded.** An image input stays a content part (see
   `build-message-content`).
 
 `spec->prompt` takes the request's values as a second argument. Its input
-section *is* the guide, and its interaction-format markers name only the inputs
-the request carries, so an input the model cannot see is named nowhere:
+section contains the shown-field guide and a separate declared-contract view.
+The contract view preserves nested optional fields and collection-item meanings
+for supplied inputs, including empty collections and nulls; it does not claim
+those absent fields are evidence. Top-level absent inputs remain omitted from
+both views and the interaction-format markers:
 
 ```clojure
 (sio/spec->prompt support {:subject "Refund please" :account {:tier "pro"}})

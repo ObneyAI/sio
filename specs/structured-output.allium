@@ -16,6 +16,8 @@ contract StructuredOutputIntegrity {
     @invariant DescriptionMatchesContract
         -- Descriptions distinguish whether a value may be null from whether its
         -- field may be absent. Literal field names and declared meanings survive.
+        -- Distinct field or map-entry and schema descriptions retain both
+        -- meanings with their roles clear; identical meanings appear once.
     @invariant OptionalStringValueIsDecodedOnce
         -- JSON-encoded optional string values in marker responses decode to the
         -- authored string, preserving actual quote characters within that value.
@@ -38,10 +40,21 @@ contract StructuredOutputIntegrity {
         -- Malformed option metadata and unknown constraint properties fail explicitly.
         -- Object properties retain the authored output order at every size; this
         -- is request fidelity, not a guarantee about hidden model reasoning.
-        -- Required nullable values remain present. Optional non-null
-        -- values use a nullable wire sentinel paired with absence decoding.
-        -- Ambiguous optional-nullable fields, open nested objects, dynamic maps
-        -- and unsupported schema shapes fail explicitly before provider dispatch;
+        -- Required nullable values remain present. Optional non-null values use
+        -- a nullable wire sentinel paired with absence decoding. Optional nullable
+        -- fields use tagged presence objects, distinguishing absent from present
+        -- with null at both top level and nested map entries. Every wire slot
+        -- remains required; a missing wire slot is never implicit absence.
+        -- Dynamic dictionaries use closed key/value entries paired with original
+        -- key and value schemas and cardinality. Duplicate decoded keys fail
+        -- before map construction. Supported finite key domains whose distinct
+        -- typed keys share a JSON literal use tags that restore original keys.
+        -- Ambiguity within one tag fails explicitly. Nested fixed-map keys with
+        -- colliding wire names use paired aliases that reserve authored names.
+        -- Disjoint alternatives and finite field-dispatched variants preserve
+        -- their branch descriptions and original validation. Unproven overlaps,
+        -- arbitrary dispatchers, open nested objects and unsupported schema
+        -- shapes or properties fail explicitly before provider dispatch;
         -- compilation never silently narrows or drops a constraint.
         -- The same compiled contract supplies model-visible output guidance;
         -- field meanings are not confined to an external decoding constraint.

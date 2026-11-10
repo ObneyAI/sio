@@ -8,7 +8,8 @@
             [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
             [malli.core :as m]
-            [sio.core :as sio]))
+            [sio.core :as sio]
+            [sio.input-identity :as identity]))
 
 (deftest top-level-meaning-that-lives-only-in-a-description-reaches-the-guide-test
   (testing "a shown top-level input's description appears in the guide"
@@ -225,8 +226,10 @@
     (testing "the absent field's name and meaning appear nowhere in the guide"
       (is (not (str/includes? guide "owner")))
       (is (not (str/includes? guide "Staff member who holds the case"))))
-    (testing "nor anywhere in the prompt's input section (the old type line listed it)"
-      (is (not (str/includes? (input-section prompt) "owner"))))
+    (testing "the prompt separates shown evidence from the absent field's contract"
+      (let [[shown declared] (str/split (input-section prompt) #"DECLARED CONTRACT" 2)]
+        (is (not (str/includes? shown "owner")))
+        (is (str/includes? declared "Staff member who holds the case"))))
     (testing "the remaining fields are numbered as a list of their own"
       (is (str/includes? guide "   2. `opened-by`")))))
 
@@ -506,7 +509,8 @@
                   "   2. `b` (str): from the schema\n"
                   "   3. `c` (str or null): from inside a maybe\n"
                   "   4. `d` (str or null): from the maybe itself\n"
-                  "   5. `e` (str): entry wins")
+                  "   5. `e` (str): Entry meaning: entry wins\n"
+                  "   Schema meaning: schema loses")
              guide))))
 
   (testing "a collection's own properties carry its meaning and do not hide its item type"
@@ -520,11 +524,11 @@
       (is (str/includes? guide "`touches` (json array of json object): Past touches"))
       (is (str/includes? guide "`kind` (str): What happened"))))
 
-  (testing "at the top level the field's own description wins over its schema's"
+  (testing "at the top level distinct field and schema descriptions retain their roles"
     (is (str/includes?
          (sio/input-field-guide [{:name :q :spec [:string {:description "schema"}] :description "field"}]
                                 {:q "x"})
-         "`q` (str): field")))
+         "`q` (str): Field meaning: field\nSchema meaning: schema")))
 
   (testing "an undescribed top-level field still shows the meaning its schema carries"
     (is (str/includes?
@@ -1212,3 +1216,179 @@
       (let [prompt (sio/spec->prompt spec values)]
         (is (= shown (in-guide prompt)) (str "guide for " (pr-str values)))
         (is (= shown (in-markers prompt)) (str "markers for " (pr-str values)))))))
+
+(deftest request-guide-retains-empty-and-absent-nested-contracts
+  (let [field {:name :audit :spec [:maybe [:map
+                [:annotation {:optional true :description "Analyst interpretation, not new evidence"} :string]
+                [:unconfirmed-ids [:vector [:string {:description "Identifier awaiting confirmation"}]]]]]}
+        contract {:inputs [field {:name :absent :spec :string :description "NEVER SENT"}
+                                  {:name :photo :type :image}]
+                  :outputs [{:name :out :spec :string}]}]
+    (doseq [value [{:unconfirmed-ids []} nil]]
+      (let [shown (sio/input-field-guide [field] {:audit value})
+            prompt (sio/spec->prompt contract {:audit value :photo "image"})]
+        (is (not (str/includes? shown "Analyst interpretation")))
+        (is (str/includes? prompt "DECLARED CONTRACT"))
+        (is (str/includes? prompt "not supplied evidence"))
+        (is (str/includes? prompt "Analyst interpretation, not new evidence"))
+        (is (str/includes? prompt "Identifier awaiting confirmation"))
+        (is (not (str/includes? prompt "NEVER SENT")))))))
+
+(deftest declared-contract-retains-tuple-and-conjunct-child-meanings
+  (let [inputs [{:name :pair :spec [:tuple [:string {:description "First coordinate"}]
+                                         [:map [:note {:optional true :description "Tuple annotation"} :string]]]}
+                {:name :constrained :spec [:and [:map [:annotation {:optional true :description "Conjunct annotation"} :string]]
+                                                [:map {:description "Second constraint"}]]}]
+        values {:pair ["x" {}] :constrained {}}
+        shown (sio/input-field-guide inputs values)
+        request (sio/spec->prompt {:inputs inputs :outputs []} values)]
+    (doseq [text ["First coordinate" "Tuple annotation" "Conjunct annotation" "Second constraint"]]
+      (is (not (str/includes? shown text)))
+      (is (str/includes? request text)))
+    (is (str/includes? request "position[0]"))
+    (is (str/includes? request "conjunct[1]"))))
+
+(deftest empty-input-contract-retains-declared-alternatives-and-prepared-identities
+  (let [inputs [{:name :records :spec [:vector [:or
+                 [:map {:description "A confirmed record"} [:status [:enum {:descriptions {"yes" "Confirmed by a source"}} "yes"]]]
+                 [:map {:description "An unconfirmed record"} [:status [:enum "no"]]]]]}
+                {:name :dictionary :spec [:map-of [:string {:description "External lookup identifier"}] :string]}
+                {:name :packet :spec [:map
+                  [:same {:optional true :description "Keyword label"} :string]
+                  ["same" {:optional true :description "String count"} :int]]}]
+        prepared (identity/prepare-inputs inputs {:records [] :packet {} :dictionary {}})
+        shown (sio/input-field-guide (:inputs prepared) (:values prepared))
+        request (sio/input-request-guide (:inputs prepared) (:values prepared))]
+    (doseq [meaning ["A confirmed record" "An unconfirmed record" "Confirmed by a source" "Keyword label" "String count"]]
+      (is (not (str/includes? shown meaning)))
+      (is (str/includes? request meaning)))
+    (is (str/includes? request "External lookup identifier"))
+    (is (str/includes? request "branch[0]"))
+    (is (str/includes? request "branch[1]"))
+    (is (str/includes? request "one of: yes"))
+    (doseq [field (:inputs prepared)]
+      (is (str/includes? request (str "`" (name (:name field)) "`"))))))
+
+(deftest request-guide-references-shown-meanings-without-duplicating-them
+  (let [inputs [{:name :audit :description "Audit input meaning"
+                 :spec [:map
+                         [:status {:description "Known status meaning"} :string]
+                         [:annotation {:optional true :description "Unseen annotation meaning"} :string]]}]
+        values {:audit {:status "open"}}
+        shown (sio/input-field-guide inputs values)
+        request (sio/spec->prompt {:inputs inputs :outputs []} values)]
+    (is (= 1 (count (re-seq #"Audit input meaning" request))))
+    (is (= 1 (count (re-seq #"Known status meaning" request))))
+    (is (= 1 (count (re-seq #"Unseen annotation meaning" request))))
+    (is (str/includes? request "same meaning as `shown.audit.status`"))
+    (is (str/includes? shown "Known status meaning"))
+    (is (not (str/includes? shown "Unseen annotation meaning")))))
+
+(deftest request-guide-resolves-local-registry-record-contracts
+  (let [schema [:schema {:registry {:example/record
+                                    [:map [:annotation {:optional true :description "Referenced optional meaning"} :string]]}}
+                :example/record]
+        inputs [{:name :packet :spec schema}]
+        values {:packet {}}
+        prepared (identity/prepare-inputs inputs values)
+        guide (sio/input-request-guide (:inputs prepared) (:values prepared))]
+    (is (m/validate schema {}))
+    (is (= values (:native-values prepared)))
+    (is (= "Your input fields are:\n1. `packet` (str)"
+           (sio/input-field-guide (:inputs prepared) (:values prepared))))
+    (is (str/includes? guide "DECLARED CONTRACT"))
+    (is (str/includes? (first (str/split guide #"DECLARED CONTRACT")) "`packet` (json object)"))
+    (is (str/includes? guide "`packet` (json object)"))
+    (is (str/includes? guide "`annotation` (str, optional): Referenced optional meaning"))))
+
+(deftest request-guide-keeps-compiled-local-schemas-and-recursive-definitions-finite
+  (let [schema (m/schema
+                 [:schema {:description "Registered envelope meaning"
+                           :registry {:example/node
+                                      [:map {:description "Recursive node meaning"}
+                                       [:annotation {:optional true :description "Recursive optional meaning"} :string]
+                                       [:children {:optional true :description "Descendant relation"}
+                                        [:vector [:ref {:description "Child reference meaning"} :example/node]]]]}}
+                  :example/node])
+        inputs [{:name :packet :spec schema}]
+        values {:packet {}}
+        prepared (identity/prepare-inputs inputs values)
+        guide (sio/input-request-guide (:inputs prepared) (:values prepared))]
+    (is (m/validate schema {}))
+    (is (= values (:native-values prepared)))
+    (doseq [meaning ["Registered envelope meaning" "Recursive node meaning"
+                     "Recursive optional meaning" "Descendant relation" "Child reference meaning"]]
+      (is (= 1 (count (re-seq (re-pattern meaning) guide))) meaning))
+    (is (str/includes? guide "`packet` (json object)"))
+    (is (str/includes? guide "reference to enclosing named schema :example/node"))
+    (is (< (count guide) 4000))
+    (is (not (str/includes? guide "#object")))))
+
+(deftest nullable-containers-of-compiled-named-records-have-accurate-request-types
+  (let [record-schema (m/schema [:schema {:registry {:example/record
+                                                     [:map [:annotation {:optional true :description "Nullable item meaning"} :string]]}}
+                               :example/record])
+        schema (m/schema [:maybe [:vector record-schema]])
+        inputs [{:name :packets :spec schema}]]
+    (doseq [value [nil [] [{}]]]
+      (let [values {:packets value}
+            prepared (identity/prepare-inputs inputs values)
+            guide (sio/input-request-guide (:inputs prepared) (:values prepared))
+            shown (first (str/split guide #"DECLARED CONTRACT"))]
+        (is (m/validate schema value))
+        (is (= {:packets value} values))
+        (is (str/includes? shown "`packets` (json array of json object or null)"))
+        (is (not (str/includes? shown "json array of str")))
+        (is (= 1 (count (re-seq #"Nullable item meaning" guide))))))))
+
+(deftest compiled-nested-local-references-retain-their-registry-during-preparation
+  (let [schema (m/schema [:map {:registry {:example/record
+                                           [:map [:annotation {:optional true :description "Nested registered meaning"} :string]]}}
+                         [:nested :example/record]])
+        inputs [{:name :packet :spec schema}]
+        values {:packet {:nested {}}}
+        prepared (identity/prepare-inputs inputs values)
+        guide (sio/input-request-guide (:inputs prepared) (:values prepared))]
+    (is (m/validate schema (:packet values)))
+    (is (= {:packet {:nested {}}} values))
+    (is (= {:packet {"nested" {}}} (:native-values prepared)))
+    (is (str/includes? guide "`nested` (json object)"))
+    (is (str/includes? guide "Nested registered meaning"))))
+
+(deftest unexpanded-custom-constraints-are-labeled-without-opaque-host-functions
+  (let [schema [:fn {:description "Application predicate meaning"} map?]
+        inputs [{:name :packet :spec schema}]
+        guide (sio/input-request-guide inputs {:packet {}})]
+    (is (m/validate schema {}))
+    (is (str/includes? guide "declared constraint :fn; nested shape not expanded"))
+    (is (= 1 (count (re-seq #"Application predicate meaning" guide))))
+    (is (not (str/includes? guide "#object")))))
+
+(deftest compiled-predicate-schema-wrappers-retain-their-meaning
+  (let [schema (m/schema [:schema {:description "Predicate scalar meaning"} 'string?])
+        guide (sio/input-request-guide [{:name :text :spec schema}] {:text "hello"})]
+    (is (m/validate schema "hello"))
+    (is (str/includes? guide "`text` (str)"))
+    (is (= 1 (count (re-seq #"Predicate scalar meaning" guide))))))
+
+(deftest request-types-describe-conjunctions-comparisons-and-literal-values
+  (let [inputs [{:name :record :spec [:and [:map [:annotation {:optional true :description "Optional explanation"} :string]]
+                                          [:map]]}
+                {:name :number :spec [:>= 0]}
+                {:name :numeric :spec 'number?}
+                {:name :registered-numeric :spec [:schema {:registry {:number 'number?}} :number]}
+                {:name :literal :spec [:= 7]}]
+        values {:record {} :number 2 :numeric 2.5 :registered-numeric 3.5 :literal 7}
+        guide (sio/input-request-guide inputs values)
+        shown (first (str/split guide #"DECLARED CONTRACT"))]
+    (is (= values (sio/validate-inputs inputs values)))
+    (is (str/includes? shown "`record` (all of: json object and json object)"))
+    (is (str/includes? shown "`number` (constraint: >= 0)"))
+    (is (str/includes? shown "`numeric` (number)"))
+    (is (str/includes? shown "`registered-numeric` (number)"))
+    (is (str/includes? shown "`literal` (literal: 7)"))
+    (is (str/includes? guide "Optional explanation"))
+    (is (not (re-find #"`(?:record|number|literal)` \(str\)" guide)))
+    (doseq [field inputs]
+      (is (str/includes? (sio/input-field-guide [field] values)
+                         (str "`" (name (:name field)) "` (str)"))))))
